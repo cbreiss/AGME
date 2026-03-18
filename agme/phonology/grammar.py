@@ -1,0 +1,164 @@
+"""MaxEnt phonological grammar.
+
+Scores P(SR | UR) using *MAP constraints and learns weights via L-BFGS-B.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from scipy.optimize import minimize
+
+from agme.phonology.candidates import candidates_for
+from agme.phonology.constraints import StarMapConstraint
+from agme.utils import logsumexp
+
+
+class MaxEntPhonology:
+    """Log-linear (MaxEnt) model over UR→SR mappings.
+
+    Parameters
+    ----------
+    constraints : list[StarMapConstraint]
+        The *MAP constraint set (one per segment pair).
+    alphabet : list[str]
+        The phoneme inventory.
+    """
+
+    def __init__(
+        self,
+        constraints: list[StarMapConstraint],
+        alphabet: list[str],
+    ) -> None:
+        self.constraints = constraints
+        self.alphabet = alphabet
+        # Weights in constraint order (w ≥ 0 enforced during learning)
+        self.weights: np.ndarray = np.array(
+            [c.prior_weight for c in constraints], dtype=np.float64
+        )
+        # Caches (weight-independent)
+        self._viol_cache: dict[tuple[str, str], np.ndarray] = {}
+        self._cand_cache: dict[str, set[str]] = {}
+        # Accumulated (ur, sr) pairs for the next weight update
+        self._accumulated: list[tuple[str, str]] = []
+
+    # ------------------------------------------------------------------
+    # Core scoring
+    # ------------------------------------------------------------------
+
+    def violation_vector(self, ur: str, sr: str) -> np.ndarray:
+        """Cached violation vector for (ur, sr)."""
+        key = (ur, sr)
+        if key not in self._viol_cache:
+            viols = np.array(
+                [c.violations(ur, sr) for c in self.constraints], dtype=np.float64
+            )
+            self._viol_cache[key] = viols
+        return self._viol_cache[key]
+
+    def harmony(self, ur: str, sr: str) -> float:
+        """H(ur, sr) = w · violations(ur, sr).  Higher = more marked."""
+        return float(np.dot(self.weights, self.violation_vector(ur, sr)))
+
+    def _candidates(self, ur: str) -> set[str]:
+        if ur not in self._cand_cache:
+            self._cand_cache[ur] = candidates_for(ur, self.alphabet)
+        return self._cand_cache[ur]
+
+    def log_prob(self, ur: str, sr: str) -> float:
+        """log P(SR | UR) = -H(ur, sr) - log Z(ur)."""
+        cands = self._candidates(ur)
+        cands = cands | {sr}  # always include the observed SR
+        log_z = logsumexp([-self.harmony(ur, c) for c in cands])
+        return -self.harmony(ur, sr) - log_z
+
+    # ------------------------------------------------------------------
+    # Weight learning
+    # ------------------------------------------------------------------
+
+    def accumulate(self, ur: str, sr: str) -> None:
+        """Record a (ur, sr) pair for the next weight update."""
+        self._accumulated.append((ur, sr))
+
+    def fit_weights(self, learning_rate: float = 1.0) -> None:
+        """Update weights via L-BFGS-B on the accumulated (ur, sr) pairs.
+
+        Minimises:  -log-likelihood  +  half-normal prior penalty
+        Clears the accumulation buffer after the update.
+        """
+        if not self._accumulated:
+            return
+
+        pairs = list(self._accumulated)
+        self._accumulated.clear()
+
+        # Pre-compute violation vectors and candidate sets
+        all_cands: dict[str, set[str]] = {}
+        obs_viols: list[np.ndarray] = []
+        for ur, sr in pairs:
+            cands = self._candidates(ur) | {sr}
+            all_cands[ur] = cands
+            obs_viols.append(self.violation_vector(ur, sr))
+
+        # Prior σ per constraint (from P-map initialisation)
+        prior_sigma = np.array([c.prior_weight for c in self.constraints], dtype=np.float64)
+        prior_sigma = np.where(prior_sigma > 0, prior_sigma, 1.0)
+
+        def neg_log_posterior(w: np.ndarray) -> tuple[float, np.ndarray]:
+            # Expected violations per (ur, sr) pair
+            total_nll = 0.0
+            grad = np.zeros_like(w)
+            for (ur, sr), obs_v in zip(pairs, obs_viols):
+                cands = all_cands[ur]
+                harm = {c: float(np.dot(w, self.violation_vector(ur, c))) for c in cands}
+                log_z = logsumexp([-h for h in harm.values()])
+                total_nll += harm[sr] + log_z  # observed harmony + log Z
+                # Gradient: observed − expected violations
+                exp_viols = np.zeros(len(self.constraints))
+                for c, h in harm.items():
+                    exp_viols += np.exp(-h - log_z) * self.violation_vector(ur, c)
+                grad += obs_v - exp_viols  # gradient of log-likelihood
+
+            # Half-normal prior: -log p(w) = Σ w_i² / (2 σ_i²)
+            prior_nll = float(np.sum(w**2 / (2 * prior_sigma**2)))
+            prior_grad = w / prior_sigma**2
+
+            # We minimise neg log posterior, so gradient flips sign
+            return total_nll + prior_nll, -(grad) + prior_grad
+
+        result = minimize(
+            neg_log_posterior,
+            x0=self.weights.copy(),
+            jac=True,
+            method="L-BFGS-B",
+            bounds=[(0.0, None)] * len(self.weights),
+            options={"maxiter": 200, "ftol": 1e-9},
+        )
+        self.weights = result.x
+        # Invalidate log-prob cache (violation vectors are weight-independent)
+
+    # ------------------------------------------------------------------
+    # Extensibility hook: weight_updater swap-in point
+    # ------------------------------------------------------------------
+
+    def run_weight_update(self) -> None:
+        """Call this to trigger a weight update step.
+
+        Currently delegates to fit_weights (MAP via L-BFGS-B).
+        Future extension: swap for HMC posterior sampling.
+        """
+        self.fit_weights()
+
+    # ------------------------------------------------------------------
+    # Introspection
+    # ------------------------------------------------------------------
+
+    def faithfulness_weights(self) -> dict[str, dict]:
+        """Return a dict of constraint → {weight, prior, deviation}."""
+        result = {}
+        for c, w in zip(self.constraints, self.weights):
+            result[repr(c)] = {
+                "weight": float(w),
+                "prior": c.prior_weight,
+                "deviation": float(w) - c.prior_weight,
+            }
+        return result

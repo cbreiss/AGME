@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agme"
+version = "0.1.0"
+description = "Joint morphological segmentation and phonological grammar learning"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy",
+    "scipy",
+    "panphon",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["agme*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
