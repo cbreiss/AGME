@@ -1,4 +1,33 @@
-"""Outer training loop: interleaved Gibbs segmentation + MaxEnt weight updates."""
+"""Outer training loop: interleaved Gibbs segmentation + MaxEnt weight updates.
+
+Training algorithm
+------------------
+The model alternates two kinds of updates:
+
+1.  Gibbs sweeps over utterances (discrete sampling)
+    For each surface form:
+      a. Remove the current parse from all PYP caches (decrement counts).
+      b. Re-sample the segmentation + UR assignment via forward-backward DP
+         (see inference/segmenter.py), conditioning on the current grammar
+         weights and the counts of all *other* utterances' parses.
+      c. Add the new parse back into the PYP caches.
+      d. Accumulate (ur, sr_span) pairs for the next MaxEnt update.
+
+2.  MaxEnt weight update (continuous optimisation)
+    Every `maxent_update_every` sweeps, call phon_grammar.run_weight_update()
+    which runs L-BFGS-B on the accumulated (ur, sr) pairs and clears the
+    accumulation buffer.
+
+After `burn_in` sweeps, UR posterior counts are accumulated for reporting.
+
+State
+-----
+TrainingState.parses : list[list[SpanParse]]
+    Current parse (segmentation + UR assignment) for each utterance.
+    Length = len(surface_forms).  Updated in-place each sweep.
+TrainingState.ur_posterior : dict[str, float]
+    Normalised posterior frequency of each UR type (post burn-in).
+"""
 
 from __future__ import annotations
 

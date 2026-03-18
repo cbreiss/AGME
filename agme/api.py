@@ -1,4 +1,35 @@
-"""Public API: Model and ParseResult."""
+"""Public API: Model and ParseResult.
+
+Entry point for users of the AGME package.  All internal components
+(phonological grammar, morphological grammar, inference loop) are
+assembled and wired together here.
+
+Typical usage
+-------------
+    from agme import Model
+
+    model = Model(morpheme_classes=["stem", "suffix"])
+    model.fit(["dɑgz", "kæts", "bʊks"], n_sweeps=200, burn_in=50)
+
+    result = model.parse("dɑgz")
+    # result.morphemes      → ["dɑg", "z"]
+    # result.ur             → "dɑgz"
+    # result.mappings       → [("dɑg","dɑg",[]), ("z","z",[])]
+
+    model.phonology.faithfulness_weights()   # inspect *MAP weights
+    model.morphology.morpheme_lexicon()      # inspect learned morphemes
+
+Component wiring
+----------------
+Model.fit() builds:
+  - alphabet (inferred or user-supplied)
+  - features.build_distance_matrix(alphabet)  → pairwise panphon distances
+  - phonology.constraints.build_star_map_constraints(...)  → *MAP constraint set
+  - phonology.grammar.MaxEntPhonology  → scores P(SR|UR), learns weights
+  - morphology.grammar.MorphologicalGrammar  → PYP caches + template prior
+  - inference.ur_proposer.URProposer  → UR candidate generator
+  - inference.training.run_training(...)  → runs the Gibbs + MaxEnt loop
+"""
 
 from __future__ import annotations
 
@@ -51,6 +82,11 @@ def _spans_to_parse_result(
     spans: list[SpanParse],
     phon_grammar: MaxEntPhonology,
 ) -> ParseResult:
+    """Convert a list of SpanParse objects (internal) to a ParseResult (public).
+
+    For each span, collects which *MAP constraints actually fired (weight > 0
+    and violation count > 0), and accumulates the log P(SR|UR) contribution.
+    """
     morphemes = [sp.ur for sp in spans]
     classes = [sp.morpheme_class for sp in spans]
     segmentation = [sp.start for sp in spans]
@@ -58,6 +94,7 @@ def _spans_to_parse_result(
     mappings = []
     log_prob = 0.0
     for sp in spans:
+        # "fired" = constraints with nonzero weight that have ≥1 violation on this span
         fired = [
             repr(c)
             for c, w in zip(phon_grammar.constraints, phon_grammar.weights)

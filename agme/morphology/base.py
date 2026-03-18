@@ -1,8 +1,29 @@
-"""Base distributions over morpheme strings.
+"""Base distributions G₀ over morpheme strings.
 
-Each morpheme class has its own CharacterBaseDistribution with:
-- A class-appropriate length prior
-- A class-specific character frequency distribution (Dirichlet-multinomial)
+Role in the PYP
+---------------
+Each PitmanYorCache needs a base distribution G₀ from which novel morpheme
+types are drawn when a customer opens a new table (i.e. proposes a new
+lexical type).  CharacterBaseDistribution implements G₀ as:
+
+    P(word) = P(|word|) × Π_i P(word[i])
+
+where:
+  - P(|word|) is a length prior (Poisson for stems, Geometric for affixes)
+  - P(word[i]) is a Dirichlet-multinomial character distribution, updated
+    online as morphemes are added/removed from the cache
+
+Design: shared alphabet, class-specific distributions
+------------------------------------------------------
+All morpheme classes share the same phoneme inventory (alphabet), but each
+class has its own CharacterBaseDistribution so that stems and suffixes can
+develop different character frequency profiles from data.
+
+Length priors
+-------------
+- Stems: Poisson(λ) — λ defaults to 2, learned from observed stem lengths
+- Affixes (prefix/suffix): Geometric(p_end) — p_end defaults to 0.5,
+  learned from observed affix lengths
 """
 
 from __future__ import annotations

@@ -1,4 +1,20 @@
-"""Shared numeric and string utilities."""
+"""Shared numeric and string utilities.
+
+Contents
+--------
+logsumexp(log_vals)
+    Numerically stable log-sum-exp; used everywhere a distribution over
+    log-probabilities needs to be normalised.
+
+levenshtein_alignment(s, t)
+    Optimal character alignment of two strings (UR vs SR).  The result is
+    consumed by StarMapConstraint.violations() to identify which segments
+    correspond to which and whether any are deleted/inserted.
+
+random_edit(word, alphabet, rng)
+    Single random substitution, insertion, or deletion.  Used by
+    candidates_for() and URProposer to generate exploratory UR candidates.
+"""
 
 from __future__ import annotations
 

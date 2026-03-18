@@ -1,7 +1,31 @@
 """Forward-backward DP segmenter.
 
 Samples a morphological segmentation + UR assignment for a surface form
-by marginalising over possible URs at each span.
+by exactly marginalising over:
+  - segmentation boundaries (where morphemes begin and end)
+  - morpheme class assignments (which class each span belongs to)
+  - underlying representations (which UR each span corresponds to)
+
+Algorithm
+---------
+1.  Pre-compute, for every (span, class, UR) triple:
+      joint_log_score = log P(ur | PYP_cache[class]) + log P(sr_span | ur)
+    Marginalise over UR proposals via log-sum-exp to get span_log_score[(i,j,ci)].
+
+2.  Forward (sum-product) pass:
+    State = (position_in_surface, frozenset_of_class_indices_used_so_far).
+    Enforces that class indices are always added in increasing order
+    (maintaining the canonical left→right positional ordering of morpheme classes).
+    Computes alpha_at[pos][used_classes] = log Σ P(all parses of surface[0:pos]
+                                                   using exactly used_classes).
+
+3.  At position n: weight each end state by the template prior P(template).
+
+4.  Backward sampling:
+    - Sample end state proportional to alpha[n][used] + log P(template(used)).
+    - Since class ordering is enforced, max(used_classes) is always the last
+      class added; peel it off at each backward step.
+    - For each chosen span, sample the UR from the conditional P(ur | span_score).
 """
 
 from __future__ import annotations
@@ -11,15 +35,27 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from agme.inference.ur_proposer import URProposer
 from agme.morphology.grammar import MorphologicalGrammar
 from agme.phonology.grammar import MaxEntPhonology
-from agme.inference.ur_proposer import URProposer
 from agme.utils import logsumexp
 
 
 @dataclass
 class SpanParse:
-    """A single span in a segmentation."""
+    """A single morpheme span within a segmentation.
+
+    Attributes
+    ----------
+    start, end : int
+        Character indices into the surface form (end is exclusive).
+    morpheme_class : str
+        Class label (e.g. "stem", "suffix").
+    ur : str
+        The sampled underlying representation for this morpheme.
+    sr : str
+        The observed surface sub-string surface[start:end].
+    """
     start: int
     end: int
     morpheme_class: str
@@ -45,23 +81,24 @@ def sample_segmentation(
     Parameters
     ----------
     surface : str
-        The observed surface form.
+        The observed surface form (single utterance / word).
     morph_grammar : MorphologicalGrammar
-        Provides PYP scores and template priors.
+        Provides PYP predictive scores and template priors.
     phon_grammar : MaxEntPhonology
-        Provides P(SR span | UR).
+        Provides log P(SR span | UR).
     proposer : URProposer
-        Generates candidate URs for each span.
+        Generates weighted candidate UR proposals for each span.
     max_morpheme_len : int
-        Maximum character length of a single morpheme span.
+        Maximum number of characters in a single morpheme span.
     top_k_urs : int
-        Number of UR candidates to consider per span.
+        Number of UR candidates to evaluate per (span, class) pair.
     rng : np.random.Generator | None
+        Random number generator; created fresh if None.
 
     Returns
     -------
     list[SpanParse]
-        Sampled segmentation: one SpanParse per morpheme in left-to-right order.
+        A sampled segmentation in left-to-right order.
     """
     if rng is None:
         rng = np.random.default_rng()
@@ -71,13 +108,17 @@ def sample_segmentation(
     n_classes = len(classes)
 
     # ------------------------------------------------------------------
-    # Pre-compute span scores: span_score[(i, j, cls_idx)] = log p(span)
-    # and best_ur[(i, j, cls_idx)] = MAP UR for that span
-    # where log p(span) = log P(ur | cache[cls]) + log P(sr[i:j] | ur)
-    # marginalised over top-k UR proposals
+    # Step 1: Pre-compute span scores and UR proposal lists.
+    #
+    # span_log_score[(i, j, ci)] = log Σ_ur P(ur | cache[ci]) · P(sr[i:j] | ur)
+    #   This is the marginal log probability of span [i,j) as class ci,
+    #   summed over the top-k UR proposals (importance-sampled approximation).
+    #
+    # span_ur_proposals[(i, j, ci)] = [(ur, log_joint_score), ...]
+    #   Stored so the backward pass can sample the UR from its conditional.
     # ------------------------------------------------------------------
     span_log_score: dict[tuple[int, int, int], float] = {}
-    span_best_ur: dict[tuple[int, int, int], str] = {}
+    span_ur_proposals: dict[tuple[int, int, int], list[tuple[str, float]]] = {}
 
     for i in range(n):
         for j in range(i + 1, min(i + max_morpheme_len + 1, n + 1)):
@@ -87,101 +128,134 @@ def sample_segmentation(
                 proposals = proposer.propose(sr_span, lexicon, top_k=top_k_urs)
                 if not proposals:
                     continue
-                log_scores = []
-                for ur, prop_w in proposals:
+
+                log_scores: list[float] = []
+                for ur, _proposal_weight in proposals:
                     morph_lp = morph_grammar.morpheme_log_prob(ur, cls)
                     phon_lp = phon_grammar.log_prob(ur, sr_span)
                     log_scores.append(morph_lp + phon_lp)
-                # Marginal log probability (log-sum-exp over URs)
-                span_log_score[(i, j, ci)] = logsumexp(log_scores)
-                # MAP UR (highest joint score)
-                best_idx = int(np.argmax(log_scores))
-                span_best_ur[(i, j, ci)] = proposals[best_idx][0]
+
+                key = (i, j, ci)
+                # Marginal over URs (for the forward pass)
+                span_log_score[key] = logsumexp(log_scores)
+                # Per-UR scores (for UR sampling in the backward pass)
+                span_ur_proposals[key] = [
+                    (proposals[k][0], log_scores[k]) for k in range(len(proposals))
+                ]
 
     # ------------------------------------------------------------------
-    # Forward pass: alpha[pos][cls_idx] = log prob of best segmentation
-    # of surface[0:pos] where the last morpheme had class cls_idx
-    # We use a flat representation: alpha[pos] = log prob of reaching pos
-    # summed over all valid class sequences (template-consistent).
+    # Step 2: Forward (sum-product) pass.
     #
-    # For simplicity we track: alpha[pos] = log prob of surface[0:pos]
-    # under any valid template prefix, along with the last class used.
+    # DP state: (position, frozenset of class indices used so far).
+    # alpha_at[pos][used_classes] = log-sum over all parse prefixes of
+    #   surface[0:pos] that use exactly the classes in used_classes,
+    #   in canonical order (enforced by requiring ci > max(prev_used)).
+    #
+    # Initialise at position 0 with the empty class set.
     # ------------------------------------------------------------------
-
-    # alpha[pos] = log prob of segmenting surface[0:pos]
-    # We track all (log_prob, last_cls_idx, last_span_start) for sampling
-    NEG_INF = float("-inf")
-
-    # alpha[(pos, last_cls_idx)] = log prob of being at pos with last class ci
-    # Initial state: position 0, no class yet (use sentinel -1)
-    alpha: dict[tuple[int, int], float] = {(0, -1): 0.0}
+    alpha_at: dict[int, dict[frozenset, float]] = {0: {frozenset(): 0.0}}
 
     for pos in range(1, n + 1):
-        for j in [pos]:
-            for i in range(max(0, pos - max_morpheme_len), pos):
-                sr_span = surface[i:j]
-                for ci, cls in enumerate(classes):
-                    key = (i, j, ci)
-                    if key not in span_log_score:
+        alpha_at[pos] = {}
+        for i in range(max(0, pos - max_morpheme_len), pos):
+            if not alpha_at.get(i):
+                continue
+            for ci in range(n_classes):
+                key = (i, pos, ci)
+                if key not in span_log_score:
+                    continue
+                span_lp = span_log_score[key]
+                for prev_used, prev_lp in alpha_at[i].items():
+                    # Enforce: ci must not already be used, and must be the
+                    # largest class index so far (canonical left→right order).
+                    if ci in prev_used:
                         continue
-                    span_lp = span_log_score[key]
-                    # Check template consistency: ci must come after last_ci
-                    for last_ci in range(-1, n_classes):
-                        if last_ci >= ci:
-                            continue  # class order must be non-decreasing
-                        prev_key = (i, last_ci)
-                        if prev_key not in alpha:
-                            continue
-                        new_lp = alpha[prev_key] + span_lp
-                        cur_key = (pos, ci)
-                        if cur_key not in alpha or alpha[cur_key] < new_lp:
-                            alpha[cur_key] = new_lp
+                    if prev_used and max(prev_used) >= ci:
+                        continue
+                    new_used = prev_used | frozenset({ci})
+                    new_lp = prev_lp + span_lp
+                    cur = alpha_at[pos].get(new_used, float("-inf"))
+                    alpha_at[pos][new_used] = logsumexp([cur, new_lp])
 
     # ------------------------------------------------------------------
-    # Check if any valid segmentation was found
+    # Step 3: Weight end states by template prior.
+    #
+    # The template prior P(template) favours certain morpheme-class
+    # sequences over others.  It is applied here rather than in the
+    # forward pass because it is a global property of the full parse,
+    # not factorisable per span.
     # ------------------------------------------------------------------
-    end_states = [(n, ci) for ci in range(n_classes) if (n, ci) in alpha]
-    if not end_states:
-        # Fallback: treat entire surface as a single stem
+    end_alpha = alpha_at.get(n, {})
+    if not end_alpha:
+        # Fallback: no valid segmentation found — treat the whole surface
+        # as a single stem.
         stem_ci = classes.index("stem") if "stem" in classes else 0
         return [SpanParse(0, n, classes[stem_ci], surface, surface)]
 
-    # ------------------------------------------------------------------
-    # Backward sampling
-    # ------------------------------------------------------------------
-    # Sample end state proportional to exp(alpha)
-    end_lps = [alpha[(n, ci)] for _, ci in end_states]
-    end_probs = np.exp(np.array(end_lps) - logsumexp(end_lps))
-    chosen_end_idx = int(rng.choice(len(end_states), p=end_probs))
-    pos, last_ci = end_states[chosen_end_idx]
+    # Build (used_classes, final_log_score) pairs incorporating the template prior
+    end_items: list[tuple[frozenset, float]] = []
+    for used_classes, lp in end_alpha.items():
+        template = tuple(classes[ci] for ci in sorted(used_classes))
+        prior_lp = morph_grammar.template_log_prior(template)
+        end_items.append((used_classes, lp + prior_lp))
 
+    # ------------------------------------------------------------------
+    # Step 4: Backward sampling.
+    #
+    # (a) Sample the end state (which class set covers the whole surface).
+    # (b) Peel off spans right-to-left.  Because class ordering is enforced,
+    #     max(cur_used) is always the class of the rightmost span.
+    # (c) For each chosen span, sample the UR from P(ur | span_score).
+    # ------------------------------------------------------------------
+
+    # (a) Sample end state
+    end_lps = [lp for _, lp in end_items]
+    end_probs = np.exp(np.array(end_lps) - logsumexp(end_lps))
+    chosen_idx = int(rng.choice(len(end_items), p=end_probs))
+    cur_used, _ = end_items[chosen_idx]
+
+    pos = n
     result: list[SpanParse] = []
-    while pos > 0:
-        # Find all spans that could have ended here with class last_ci
-        candidates_back = []
+
+    while pos > 0 and cur_used:
+        # (b) The rightmost class is always max(cur_used) due to ordering
+        ci = max(cur_used)
+        prev_used = frozenset(cur_used - {ci})
+
+        # Collect all spans (i → pos, ci) that are compatible with the
+        # predecessor state (i, prev_used)
+        candidates_back: list[tuple[int, float]] = []
         for i in range(max(0, pos - max_morpheme_len), pos):
-            key = (i, pos, last_ci)
+            key = (i, pos, ci)
             if key not in span_log_score:
                 continue
-            for prev_ci in range(-1, last_ci):
-                prev_alpha_key = (i, prev_ci)
-                if prev_alpha_key not in alpha:
-                    continue
-                combined = alpha[prev_alpha_key] + span_log_score[key]
-                candidates_back.append((i, prev_ci, combined))
+            prev_lp = alpha_at.get(i, {}).get(prev_used, float("-inf"))
+            if not math.isfinite(prev_lp):
+                continue
+            candidates_back.append((i, prev_lp + span_log_score[key]))
 
         if not candidates_back:
-            break
+            break  # should not happen in a well-formed DP, but guard against it
 
-        lps = [c[2] for c in candidates_back]
-        probs = np.exp(np.array(lps) - logsumexp(lps))
-        chosen = int(rng.choice(len(candidates_back), p=probs))
-        i, prev_ci, _ = candidates_back[chosen]
-        sr_span = surface[i:pos]
-        ur = span_best_ur.get((i, pos, last_ci), sr_span)
-        result.append(SpanParse(i, pos, classes[last_ci], ur, sr_span))
-        pos = i
-        last_ci = prev_ci
+        # Sample span start position
+        back_lps = [c[1] for c in candidates_back]
+        back_probs = np.exp(np.array(back_lps) - logsumexp(back_lps))
+        chosen = int(rng.choice(len(candidates_back), p=back_probs))
+        i_chosen = candidates_back[chosen][0]
+
+        # (c) Sample UR for this span from its conditional distribution
+        key = (i_chosen, pos, ci)
+        ur_proposals = span_ur_proposals[key]
+        ur_lps = [lp for _, lp in ur_proposals]
+        ur_probs = np.exp(np.array(ur_lps) - logsumexp(ur_lps))
+        ur_idx = int(rng.choice(len(ur_proposals), p=ur_probs))
+        chosen_ur = ur_proposals[ur_idx][0]
+
+        sr_span = surface[i_chosen:pos]
+        result.append(SpanParse(i_chosen, pos, classes[ci], chosen_ur, sr_span))
+
+        pos = i_chosen
+        cur_used = prev_used
 
     result.reverse()
     return result

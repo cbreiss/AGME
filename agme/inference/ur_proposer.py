@@ -1,7 +1,28 @@
 """UR proposal distribution for a given SR span.
 
-Generates candidate URs weighted by perceptual cost (P-map prior),
-favouring candidates that require cheap phonological alternations.
+Role in inference
+-----------------
+The segmenter cannot enumerate all possible URs — the space is infinite.
+URProposer acts as an importance-sampling proposal distribution q(ur | sr).
+For each span, it returns a small weighted set of candidate URs.
+
+The segmenter then computes the *unnormalized* joint scores
+    p(ur, sr | model) ∝ P(ur | PYP_cache) · P(sr | ur, grammar)
+for each proposal and marginalises via log-sum-exp to get the span score.
+The UR is finally *sampled* (not MAP'd) from the conditional proportional
+to these scores during the backward pass.
+
+Proposal sources
+----------------
+1. The SR itself — the "faithful" candidate.  Given highest weight so that
+   the model always seriously considers no alternation.
+2. Existing UR types in the PYP lexicon — rich-get-richer effect; known
+   morphemes are more likely candidates than novel ones.
+3. Single-operation P-map-weighted edits of the SR — substitutions,
+   insertions, deletions, weighted by 1/(panphon_distance + ε) so that
+   perceptually cheap alternations (e.g. s→z) are tried more than costly
+   ones (e.g. s→m).
+4. A small number of random multi-edit candidates for mixing.
 """
 
 from __future__ import annotations
