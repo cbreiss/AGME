@@ -115,10 +115,13 @@ class MaxEntPhonology:
         self._viol_matrix_cache: dict[str, np.ndarray] = {}
         # ur → {sr: row_index} — maps each candidate SR to its row in the matrix.
         self._cand_to_row: dict[str, dict[str, int]] = {}
-        # Weight-dependent cache (cleared after each weight update) --------
-        # ur → H(ur, *) = V_ur @ w, shape (n_cands,).  Avoids recomputing the
-        # matmul on every log_prob call within the same sweep.
+        # Weight-dependent caches (cleared after each weight update) -------
+        # ur → H(ur, *) = V_ur @ w, shape (n_cands,).
         self._harmonies_cache: dict[str, np.ndarray] = {}
+        # ur → log Z(ur) = logsumexp(-H(ur, *)).  Computed once per UR per
+        # sweep alongside _harmonies_cache; reduces log_prob to two dict
+        # lookups + one subtraction after the first call for a given UR.
+        self._log_z_cache: dict[str, float] = {}
         # Accumulated (ur, sr) observation counts for the next weight update.
         # Counter deduplicates: identical pairs across tokens/sweeps are stored
         # once and multiplied by count in the gradient, so memory is O(unique pairs)
@@ -240,6 +243,7 @@ class MaxEntPhonology:
                 [self._viol_matrix_cache[ur], new_row]
             )
             self._harmonies_cache.pop(ur, None)
+            self._log_z_cache.pop(ur, None)
 
         return self._viol_matrix_cache[ur], self._cand_to_row[ur][sr]
 
@@ -258,15 +262,12 @@ class MaxEntPhonology:
         V, sr_idx = self._ensure_cand_matrix(ur, sr)
 
         if ur not in self._harmonies_cache:
-            self._harmonies_cache[ur] = V @ self.weights   # (n_cands,)
-        harmonies = self._harmonies_cache[ur]
-
-        # Numerically stable logsumexp over -harmonies
-        neg_h = -harmonies
-        m = neg_h.max()
-        log_z = float(m + np.log(np.sum(np.exp(neg_h - m))))
-
-        return float(-harmonies[sr_idx] - log_z)
+            harmonies = V @ self.weights                   # (n_cands,)
+            self._harmonies_cache[ur] = harmonies
+            neg_h = -harmonies
+            m = neg_h.max()
+            self._log_z_cache[ur] = float(m + np.log(np.sum(np.exp(neg_h - m))))
+        return float(-self._harmonies_cache[ur][sr_idx] - self._log_z_cache[ur])
 
     # ------------------------------------------------------------------
     # Weight learning
@@ -368,9 +369,10 @@ class MaxEntPhonology:
             options={"maxiter": 200, "ftol": 1e-9},
         )
         self.weights = result.x
-        # Harmonies depend on weights: clear cache after each update.
+        # Harmonies and log-Z depend on weights: clear after each update.
         # Violation matrices are weight-independent and are NOT cleared.
         self._harmonies_cache.clear()
+        self._log_z_cache.clear()
 
     # ------------------------------------------------------------------
     # Extensibility hook: weight_updater swap-in point
