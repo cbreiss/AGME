@@ -50,6 +50,8 @@ Swap fit_weights for an HMC sampler to get full posterior over weights.
 
 from __future__ import annotations
 
+from collections import Counter
+
 import numpy as np
 from scipy.optimize import minimize
 
@@ -97,8 +99,11 @@ class MaxEntPhonology:
         # cleared by run_weight_update() since harmony = w · viol_vec changes
         # with weights.  Replaces np.dot per call with a dict lookup.
         self._harmony_cache: dict[tuple[str, str], float] = {}
-        # Accumulated (ur, sr) pairs for the next weight update
-        self._accumulated: list[tuple[str, str]] = []
+        # Accumulated (ur, sr) observation counts for the next weight update.
+        # Counter deduplicates: identical pairs across tokens/sweeps are stored
+        # once and multiplied by count in the gradient, so memory is O(unique pairs)
+        # rather than O(tokens × sweeps).
+        self._accumulated: Counter[tuple[str, str]] = Counter()
 
         # ----------------------------------------------------------------
         # Pre-computed index arrays for vectorized violation counting.
@@ -206,8 +211,8 @@ class MaxEntPhonology:
     # ------------------------------------------------------------------
 
     def accumulate(self, ur: str, sr: str) -> None:
-        """Record a (ur, sr) pair for the next weight update."""
-        self._accumulated.append((ur, sr))
+        """Record a (ur, sr) observation for the next weight update."""
+        self._accumulated[(ur, sr)] += 1
 
     def fit_weights(self, learning_rate: float = 1.0) -> None:
         """Update weights via L-BFGS-B on the accumulated (ur, sr) pairs.
@@ -218,7 +223,8 @@ class MaxEntPhonology:
         if not self._accumulated:
             return
 
-        pairs = list(self._accumulated)
+        # pair_counts: {(ur, sr): count} — unique pairs only (memory-efficient)
+        pair_counts: dict[tuple[str, str], int] = dict(self._accumulated)
         self._accumulated.clear()
 
         # Pre-compute violation vectors and candidate sets.
@@ -226,11 +232,11 @@ class MaxEntPhonology:
         # union all observed SRs into the candidate set for that UR so that
         # the partition function Z(ur) is computed over all attested outputs.
         all_cands: dict[str, set[str]] = {}
-        obs_viols: list[np.ndarray] = []
-        for ur, sr in pairs:
+        obs_viols: dict[tuple[str, str], np.ndarray] = {}
+        for ur, sr in pair_counts:
             base_cands = self._candidates(ur)
             all_cands[ur] = all_cands.get(ur, base_cands) | {sr}
-            obs_viols.append(self.violation_vector(ur, sr))
+            obs_viols[(ur, sr)] = self.violation_vector(ur, sr)
 
         # Prior σ per constraint (from P-map initialisation)
         prior_sigma = np.array([c.prior_weight for c in self.constraints], dtype=np.float64)
@@ -244,20 +250,21 @@ class MaxEntPhonology:
             """
             total_nll = 0.0
             grad = np.zeros_like(w)
-            for (ur, sr), obs_v in zip(pairs, obs_viols):
+            for (ur, sr), count in pair_counts.items():
+                obs_v = obs_viols[(ur, sr)]
                 cands = all_cands[ur]
                 # Harmony H(ur, c) = w · violations(ur, c)  for each candidate c
                 harm = {c: float(np.dot(w, self.violation_vector(ur, c))) for c in cands}
                 # log Z(ur) = log Σ_c exp(-H(ur,c))
                 log_z = logsumexp([-h for h in harm.values()])
-                # neg log-likelihood for this pair: H(ur, sr) + log Z(ur)
-                total_nll += harm[sr] + log_z
-                # MaxEnt gradient: observed violations − expected violations
+                # neg log-likelihood contribution, weighted by observation count
+                total_nll += count * (harm[sr] + log_z)
+                # MaxEnt gradient: count × (observed violations − expected violations)
                 # E[violations] = Σ_c P(c|ur,w) · violations(ur,c)
                 exp_viols = np.zeros(len(self.constraints))
                 for c, h in harm.items():
                     exp_viols += np.exp(-h - log_z) * self.violation_vector(ur, c)
-                grad += obs_v - exp_viols  # positive = gradient of log-likelihood
+                grad += count * (obs_v - exp_viols)
 
             # Half-normal prior penalty: Σ w_i² / (2σ_i²)  (σ_i = P-map prior weight)
             prior_nll = float(np.sum(w**2 / (2 * prior_sigma**2)))
