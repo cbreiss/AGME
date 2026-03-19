@@ -55,7 +55,7 @@ from scipy.optimize import minimize
 
 from agme.phonology.candidates import candidates_for
 from agme.phonology.constraints import StarMapConstraint
-from agme.utils import logsumexp
+from agme.utils import levenshtein_alignment, logsumexp
 
 
 class MaxEntPhonology:
@@ -64,7 +64,9 @@ class MaxEntPhonology:
     Parameters
     ----------
     constraints : list[StarMapConstraint]
-        The *MAP constraint set (one per segment pair).
+        The full constraint set.  Includes *MAP(a,b) substitution constraints
+        plus *MAP(∅,b) insertion and *MAP(a,∅) deletion constraints (all
+        represented as StarMapConstraint with x or y set to None).
     alphabet : list[str]
         The phoneme inventory.
     """
@@ -73,9 +75,17 @@ class MaxEntPhonology:
         self,
         constraints: list[StarMapConstraint],
         alphabet: list[str],
+        identity_only: bool = False,
+        rng: np.random.Generator | None = None,
     ) -> None:
         self.constraints = constraints
         self.alphabet = alphabet
+        # When True, P(SR|UR) = 1 if SR==UR else 0.  Used to test the
+        # segmenter in isolation, without any phonological alternations.
+        self.identity_only = identity_only
+        # Seeded RNG passed from Model.fit() — used in candidates_for() so
+        # that the random multi-edit candidate set is deterministic given seed.
+        self._rng = rng
         # Weights in constraint order (w ≥ 0 enforced during learning)
         self.weights: np.ndarray = np.array(
             [c.prior_weight for c in constraints], dtype=np.float64
@@ -83,34 +93,109 @@ class MaxEntPhonology:
         # Caches (weight-independent)
         self._viol_cache: dict[tuple[str, str], np.ndarray] = {}
         self._cand_cache: dict[str, set[str]] = {}
+        # Harmony cache: {(ur, sr) → float}.  Valid between weight updates;
+        # cleared by run_weight_update() since harmony = w · viol_vec changes
+        # with weights.  Replaces np.dot per call with a dict lookup.
+        self._harmony_cache: dict[tuple[str, str], float] = {}
         # Accumulated (ur, sr) pairs for the next weight update
         self._accumulated: list[tuple[str, str]] = []
+
+        # ----------------------------------------------------------------
+        # Pre-computed index arrays for vectorized violation counting.
+        #
+        # Segment symbol → integer index.  Index 0 is the null sentinel (∅).
+        # Alphabet segments are indexed 1 … len(alphabet).
+        # This allows alignment pair counts to be stored in a 2-D matrix
+        # and all context-free constraint violations to be read out with a
+        # single numpy fancy-index operation, replacing the Python listcomp.
+        # ----------------------------------------------------------------
+        self._seg_to_idx: dict[str | None, int] = {None: 0}
+        for _i, _seg in enumerate(alphabet, start=1):
+            self._seg_to_idx[_seg] = _i
+        _n = len(alphabet) + 1   # matrix dimension (null + alphabet)
+        self._n_syms: int = _n
+
+        # Constraint x/y indices — shape (N_constraints,)
+        self._c_x_idx: np.ndarray = np.array(
+            [self._seg_to_idx.get(c.x, 0) for c in constraints], dtype=np.intp
+        )
+        self._c_y_idx: np.ndarray = np.array(
+            [self._seg_to_idx.get(c.y, 0) for c in constraints], dtype=np.intp
+        )
+        # Boolean mask: True where the constraint is context-free (common case).
+        self._c_context_free: np.ndarray = np.array(
+            [c.left_ctx is None and c.right_ctx is None for c in constraints],
+            dtype=bool,
+        )
 
     # ------------------------------------------------------------------
     # Core scoring
     # ------------------------------------------------------------------
 
     def violation_vector(self, ur: str, sr: str) -> np.ndarray:
-        """Cached violation vector for (ur, sr)."""
+        """Cached violation vector for (ur, sr).
+
+        On a cache miss:
+          1. Compute levenshtein_alignment(ur, sr) once.
+          2. Build a 2-D integer count matrix C where C[ur_idx, sr_idx] = number
+             of times that alignment pair occurred.  Both None (∅) and alphabet
+             segments are mapped to integers via self._seg_to_idx.
+          3. Extract all context-free constraint violations with a single numpy
+             fancy-index: viols = C[c_x_idx, c_y_idx]  — O(N_constraints) numpy.
+          4. Context-sensitive constraints (rare; not produced by current builders)
+             fall back to count_from_alignment.
+        """
         key = (ur, sr)
         if key not in self._viol_cache:
-            viols = np.array(
-                [c.violations(ur, sr) for c in self.constraints], dtype=np.float64
-            )
+            alignment = levenshtein_alignment(ur, sr)
+
+            # Build count matrix in one Python pass over the alignment.
+            count_matrix = np.zeros((self._n_syms, self._n_syms), dtype=np.float64)
+            s2i = self._seg_to_idx
+            for ur_seg, sr_seg in alignment:
+                count_matrix[s2i.get(ur_seg, 0), s2i.get(sr_seg, 0)] += 1.0
+
+            # Vectorized lookup for context-free constraints (all current ones).
+            viols = count_matrix[self._c_x_idx, self._c_y_idx]
+
+            # Context-sensitive constraints overwrite their slots (rare fallback).
+            if not self._c_context_free.all():
+                for idx in np.where(~self._c_context_free)[0]:
+                    viols[idx] = self.constraints[idx].count_from_alignment(
+                        alignment, sr
+                    )
+
             self._viol_cache[key] = viols
         return self._viol_cache[key]
 
     def harmony(self, ur: str, sr: str) -> float:
-        """H(ur, sr) = w · violations(ur, sr).  Higher = more marked."""
-        return float(np.dot(self.weights, self.violation_vector(ur, sr)))
+        """H(ur, sr) = w · violations(ur, sr).  Higher = more marked.
+
+        Results are cached between MaxEnt weight updates.  The cache is
+        cleared by run_weight_update() since harmony values depend on weights.
+        """
+        key = (ur, sr)
+        if key not in self._harmony_cache:
+            self._harmony_cache[key] = float(
+                np.dot(self.weights, self.violation_vector(ur, sr))
+            )
+        return self._harmony_cache[key]
 
     def _candidates(self, ur: str) -> set[str]:
         if ur not in self._cand_cache:
-            self._cand_cache[ur] = candidates_for(ur, self.alphabet)
+            # Pass the model's RNG so multi-edit candidates are reproducible.
+            self._cand_cache[ur] = candidates_for(ur, self.alphabet, rng=self._rng)
         return self._cand_cache[ur]
 
     def log_prob(self, ur: str, sr: str) -> float:
-        """log P(SR | UR) = -H(ur, sr) - log Z(ur)."""
+        """log P(SR | UR) = -H(ur, sr) - log Z(ur).
+
+        If identity_only=True, returns 0.0 when ur==sr and -inf otherwise,
+        bypassing all constraint scoring.  Use this to test the segmenter
+        independently of the phonological grammar.
+        """
+        if self.identity_only:
+            return 0.0 if ur == sr else float("-inf")
         cands = self._candidates(ur)
         cands = cands | {sr}  # always include the observed SR
         log_z = logsumexp([-self.harmony(ur, c) for c in cands])
@@ -190,7 +275,9 @@ class MaxEntPhonology:
             options={"maxiter": 200, "ftol": 1e-9},
         )
         self.weights = result.x
-        # Invalidate log-prob cache (violation vectors are weight-independent)
+        # Harmony values depend on weights: clear cache after each update.
+        # Violation vectors are weight-independent and are NOT cleared.
+        self._harmony_cache.clear()
 
     # ------------------------------------------------------------------
     # Extensibility hook: weight_updater swap-in point
@@ -201,7 +288,11 @@ class MaxEntPhonology:
 
         Currently delegates to fit_weights (MAP via L-BFGS-B).
         Future extension: swap for HMC posterior sampling.
+        No-op when identity_only=True.
         """
+        if self.identity_only:
+            self._accumulated.clear()
+            return
         self.fit_weights()
 
     # ------------------------------------------------------------------

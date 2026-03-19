@@ -22,3 +22,6 @@ include = ["agme*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "slow: marks tests that run the full phonological grammar on real IPA data (deselect with -m 'not slow')",
+]

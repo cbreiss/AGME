@@ -44,11 +44,28 @@ from agme.phonology.grammar import MaxEntPhonology
 
 @dataclass
 class TrainingState:
-    """Mutable state accumulated during training."""
-    # Current parse per utterance
+    """Mutable state accumulated during training.
+
+    Fields
+    ------
+    parses : list[list[SpanParse]]
+        Current parse (segmentation + UR assignment) for each utterance.
+        Updated in-place every Gibbs sweep.
+    ur_posterior : dict[str, float]
+        Normalised posterior frequency of each UR string (post burn-in).
+        Summed over all morpheme classes and utterances.
+    parse_posterior : dict[tuple[str,str,str], float]
+        Raw posterior counts of (morpheme_class, ur, sr) triples observed
+        post burn-in.  Not normalised — raw counts allow per-class
+        normalisation in introspection methods.  Key: (cls, ur, sr_span).
+    sweep_count : int
+        Number of sweeps completed so far.
+    """
+
     parses: list[list[SpanParse]] = field(default_factory=list)
-    # Accumulated UR posterior counts (post burn-in)
     ur_posterior: dict[str, float] = field(default_factory=dict)
+    # Per-class (ur, sr) posterior counts — used by print_sr_types / print_ur_report
+    parse_posterior: dict[tuple[str, str, str], float] = field(default_factory=dict)
     sweep_count: int = 0
 
 
@@ -147,8 +164,15 @@ def run_training(
         if sweep >= burn_in:
             for parse in state.parses:
                 for sp in parse:
-                    key = sp.ur
-                    state.ur_posterior[key] = state.ur_posterior.get(key, 0.0) + 1.0
+                    # UR marginal posterior (summed over classes and SRs)
+                    state.ur_posterior[sp.ur] = (
+                        state.ur_posterior.get(sp.ur, 0.0) + 1.0
+                    )
+                    # Detailed (class, ur, sr) triple — used for introspection
+                    triple = (sp.morpheme_class, sp.ur, sp.sr)
+                    state.parse_posterior[triple] = (
+                        state.parse_posterior.get(triple, 0.0) + 1.0
+                    )
 
         # --- Progress reporting ---
         if print_every > 0 and (sweep + 1) % print_every == 0:

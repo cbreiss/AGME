@@ -24,7 +24,7 @@ Johnson et al. (NeurIPS 2006); Goldwater et al. (Cognition 2009).
 
 from __future__ import annotations
 
-import random
+import numpy as np
 
 
 class PitmanYorCache:
@@ -38,13 +38,21 @@ class PitmanYorCache:
         Concentration parameter α > -d.
     """
 
-    def __init__(self, discount: float = 0.5, concentration: float = 1.0) -> None:
+    def __init__(
+        self,
+        discount: float = 0.5,
+        concentration: float = 1.0,
+        rng: np.random.Generator | None = None,
+    ) -> None:
         if not (0.0 <= discount < 1.0):
             raise ValueError(f"discount must be in [0, 1), got {discount}")
         if concentration <= -discount:
             raise ValueError(f"concentration must be > -discount")
         self.discount = discount
         self.concentration = concentration
+        # Seeded RNG for reproducible table-assignment sampling in add()/remove().
+        # Falls back to a fresh (unseeded) generator if None — non-deterministic.
+        self._rng: np.random.Generator = rng if rng is not None else np.random.default_rng()
 
         # Primary data structure: {word: [customers_at_table_0, customers_at_table_1, ...]}
         # Each element is the count of customers seated at that table.
@@ -111,13 +119,13 @@ class PitmanYorCache:
             existing_weights = [max(s - d, 0.0) for s in sizes]
             total_weight = new_table_weight + sum(existing_weights)
 
-            if total_weight <= 0 or random.random() < new_table_weight / total_weight:
+            if total_weight <= 0 or self._rng.random() < new_table_weight / total_weight:
                 # Open a new table
                 sizes.append(1)
                 self._total_tables += 1
             else:
                 # Sit at an existing table, sampled proportional to existing_weights
-                r = random.random() * sum(existing_weights)
+                r = self._rng.random() * sum(existing_weights)
                 cumulative = 0.0
                 for k, ew in enumerate(existing_weights):
                     cumulative += ew
@@ -145,7 +153,7 @@ class PitmanYorCache:
 
         # Sample which table the departing customer belongs to,
         # proportional to table size (each customer equally likely to leave)
-        r = random.random() * n
+        r = self._rng.random() * n
         cumulative = 0.0
         chosen_k = len(sizes) - 1  # fallback
         for k, s in enumerate(sizes):

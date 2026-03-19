@@ -42,7 +42,7 @@ from agme.inference.segmenter import SpanParse, sample_segmentation
 from agme.inference.training import TrainingState, run_training
 from agme.inference.ur_proposer import URProposer
 from agme.morphology.grammar import MorphologicalGrammar
-from agme.phonology.constraints import build_star_map_constraints
+from agme.phonology.constraints import build_all_constraints
 from agme.phonology.grammar import MaxEntPhonology
 
 
@@ -137,11 +137,20 @@ class Model:
         alphabet: list[str] | None = None,
         pyp_discount: float = 0.5,
         pyp_concentration: float = 1.0,
+        identity_phonology: bool = False,
+        ipa_map: dict[str, str] | None = None,
     ) -> None:
         self._morpheme_classes = morpheme_classes or ["stem", "suffix"]
         self._alphabet = alphabet
         self._pyp_discount = pyp_discount
         self._pyp_concentration = pyp_concentration
+        # When True, phonology is bypassed: only faithful UR==SR mappings
+        # are permitted.  Useful for testing segmentation independently.
+        self._identity_phonology = identity_phonology
+        # Optional phoneme-symbol → IPA mapping for non-standard encodings
+        # (e.g. Klattbet: C→tʃ, W→aʊ).  Passed to build_distance_matrix so
+        # panphon can compute correct P-map prior weights for each constraint.
+        self._ipa_map = ipa_map
 
         # Set after fit()
         self.phonology: MaxEntPhonology | None = None
@@ -149,6 +158,8 @@ class Model:
         self._training_state: TrainingState | None = None
         self._proposer: URProposer | None = None
         self._dist_matrix: dict | None = None
+        # Seed stored for reproducibility inspection and re-fitting
+        self.seed: int | None = None
 
     # ------------------------------------------------------------------
     # Training
@@ -179,6 +190,7 @@ class Model:
         self
         """
         rng = np.random.default_rng(seed)
+        self.seed = seed  # stored for reproducibility
 
         # Build alphabet
         if self._alphabet is None:
@@ -186,17 +198,22 @@ class Model:
         else:
             alphabet = list(self._alphabet)
 
-        # Build constraint set
-        dist_matrix = build_distance_matrix(alphabet)
-        constraints = build_star_map_constraints(alphabet, dist_matrix)
+        # Build constraint set: *MAP (substitution) + *DEP (epenthesis) + *MAX (deletion)
+        # All three types are trained jointly via MaxEnt (L-BFGS-B).
+        dist_matrix = build_distance_matrix(alphabet, ipa_map=self._ipa_map)
+        constraints = build_all_constraints(alphabet, dist_matrix)
 
-        # Build model components
-        self.phonology = MaxEntPhonology(constraints, alphabet)
+        # Build model components.  Pass the seeded rng so candidates_for() is
+        # deterministic (the candidate cache is populated on first use per UR).
+        self.phonology = MaxEntPhonology(constraints, alphabet,
+                                         identity_only=self._identity_phonology,
+                                         rng=rng)
         self.morphology = MorphologicalGrammar(
             self._morpheme_classes,
             alphabet,
             pyp_discount=self._pyp_discount,
             pyp_concentration=self._pyp_concentration,
+            rng=rng,  # shared RNG for deterministic PYP table-assignment sampling
         )
         self._dist_matrix = dist_matrix
         self._proposer = URProposer(alphabet, dist_matrix, rng=rng)
@@ -263,6 +280,99 @@ class Model:
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Introspection
+    # ------------------------------------------------------------------
+
+    def print_sr_types(self) -> None:
+        """Print all surface-form types observed in the posterior, by morpheme class.
+
+        Draws from the post-burn-in parse_posterior accumulated during fit().
+        Each line shows: the SR span string, its relative frequency within
+        the class, and raw count.  Sorted by frequency descending.
+
+        Use this to see what surface shapes the model assigns to each class
+        (e.g. are stems always faithful? do suffixes cluster around /z/ and
+        /s/?).
+        """
+        self._check_fitted()
+        from collections import Counter, defaultdict
+
+        # Aggregate SR frequencies per morpheme class
+        sr_by_class: dict[str, Counter] = defaultdict(Counter)
+        for (cls, _ur, sr), count in self._training_state.parse_posterior.items():
+            sr_by_class[cls][sr] += count
+
+        for cls in self.morphology.morpheme_classes:
+            print(f"\n--- SR types ({cls}) ---")
+            counter = sr_by_class.get(cls, Counter())
+            if not counter:
+                print("  (none observed)")
+                continue
+            total = sum(counter.values())
+            for sr, count in counter.most_common():
+                print(f"  {sr!r:20s}  freq={count / total:.3f}  (n={count:.0f})")
+
+    def print_ur_report(self) -> None:
+        """Print URs with posterior probabilities and phonological mappings.
+
+        For each (morpheme class, UR, SR) triple observed post burn-in prints:
+          - The UR→SR mapping (marking faithful pairs)
+          - Posterior probability within the class
+          - log P(SR | UR) under current phonological weights
+          - Active constraints: *MAP / *DEP / *MAX that have weight > 0
+            AND at least one violation on this (UR, SR) pair
+
+        The active-constraint column shows the learned phonological analysis
+        of each observed mapping — e.g. a suffix /z/ → [s] will show the
+        *MAP(z,s) constraint, and an epenthetic [ɪ] will show *DEP(ɪ) firing
+        on the UR that lacks it.
+
+        At most 20 entries per class are shown (sorted by posterior prob).
+        """
+        self._check_fitted()
+        from collections import defaultdict
+
+        # Compute per-class totals for normalisation
+        totals: dict[str, float] = defaultdict(float)
+        for (cls, _ur, _sr), count in self._training_state.parse_posterior.items():
+            totals[cls] += count
+
+        # Build sorted entry lists per class
+        by_class: dict[str, list] = defaultdict(list)
+        for (cls, ur, sr), count in self._training_state.parse_posterior.items():
+            prob = count / totals[cls] if totals[cls] > 0 else 0.0
+            by_class[cls].append((prob, ur, sr))
+
+        width = 65
+        for cls in self.morphology.morpheme_classes:
+            print(f"\n{'=' * width}")
+            print(f"  Morpheme class: {cls}")
+            print(f"{'=' * width}")
+            print(f"  {'UR → SR':<28s}  {'post':>6}  {'logP':>8}  active constraints")
+            print(f"  {'-' * (width - 2)}")
+
+            entries = sorted(by_class.get(cls, []), reverse=True)[:20]
+            if not entries:
+                print("  (none observed)")
+                continue
+
+            for prob, ur, sr in entries:
+                log_p = self.phonology.log_prob(ur, sr)
+                # Constraints with nonzero weight that fired on this mapping
+                fired = [
+                    repr(c)
+                    for c, w in zip(
+                        self.phonology.constraints, self.phonology.weights
+                    )
+                    if w > 0 and c.violations(ur, sr) > 0
+                ]
+                mapping = f"/{ur}/ → [{sr}]" if ur != sr else f"/{ur}/ (faithful)"
+                fired_str = ", ".join(fired) if fired else "—"
+                print(
+                    f"  {mapping:<28s}  {prob:>6.3f}  {log_p:>8.3f}  {fired_str}"
+                )
 
     def _check_fitted(self) -> None:
         if self.phonology is None or self.morphology is None:

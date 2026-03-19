@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from itertools import combinations
 
+import numpy as np
+
 from agme.morphology.base import CharacterBaseDistribution, LengthPriorType
 from agme.morphology.pyp import PitmanYorCache
 
@@ -56,6 +58,7 @@ class MorphologicalGrammar:
         length_priors: dict[str, LengthPriorType] | None = None,
         char_alpha: float = 0.1,
         template_prior: dict[tuple[str, ...], float] | None = None,
+        rng: np.random.Generator | None = None,
     ) -> None:
         self.morpheme_classes = list(morpheme_classes)
         self.alphabet = alphabet
@@ -68,7 +71,8 @@ class MorphologicalGrammar:
             lp_type = lp_map.get(cls, _DEFAULT_PRIOR.get(cls, "geometric"))
             # Default length_param depends on prior type
             default_param = 2.0 if lp_type == "poisson" else 0.5
-            self.caches[cls] = PitmanYorCache(pyp_discount, pyp_concentration)
+            # Pass the shared RNG so PYP table-assignment sampling is deterministic.
+            self.caches[cls] = PitmanYorCache(pyp_discount, pyp_concentration, rng=rng)
             self.base_dists[cls] = CharacterBaseDistribution(
                 alphabet, length_prior=lp_type, length_param=default_param, char_alpha=char_alpha
             )

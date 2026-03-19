@@ -3,3 +3,31 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 .claude/
+
+# Profiling outputs
+*.prof
+profile_log.txt
+profile_results.txt
+profile_brent_results.txt
+
+# Debug/scratch scripts
+debug_*.py
+test_constraints_unified.py
+
+# Generated verification outputs
+data/klattbet_coverage.txt
+data/panphon_check.txt
+data/r_test.txt
+
+# Raw corpus directories (large; derived words_*.txt are committed instead)
+data/BreissHayesBrent/
+data/brent-phone/
+
+# Scratch data scripts
+data/check_panphon.py
+data/check_env.py
+data/survey_klattbet.py
+data/make_notebooks.py
+data/validate_notebooks.py
+data/test_r_candidates.py
+data/download_brent.py
