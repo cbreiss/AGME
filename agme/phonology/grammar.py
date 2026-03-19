@@ -31,7 +31,22 @@ _viol_cache : {(ur, sr) → np.ndarray}
     Violation vectors are weight-independent and cached permanently.
 _cand_cache : {ur → set[str]}
     Candidate SR sets depend only on the UR and alphabet; cached permanently.
-Both caches survive weight updates (no need to invalidate them).
+_viol_matrix_cache : {ur → np.ndarray}  shape (n_cands, n_constraints)
+    Violation matrix for all candidates of a given UR.  Weight-independent;
+    cached permanently.  Rows are appended when a new SR is first seen.
+_cand_to_row : {ur → {sr → int}}
+    Row index of each SR in the corresponding violation matrix.
+_harmonies_cache : {ur → np.ndarray}  shape (n_cands,)
+    H(ur, c) = V_ur @ w for every candidate c.  Recomputed lazily from the
+    violation matrix and current weights; cleared after each weight update.
+Both _viol_* caches survive weight updates; _harmonies_cache does not.
+
+Levenshtein note
+----------------
+levenshtein_alignment() is only called inside violation_vector(), which is
+itself cached by _viol_cache.  Every call to levenshtein_alignment therefore
+corresponds to a genuinely new (ur, sr) pair — there is nothing further to
+cache there.
 
 Weight learning
 ---------------
@@ -92,13 +107,18 @@ class MaxEntPhonology:
         self.weights: np.ndarray = np.array(
             [c.prior_weight for c in constraints], dtype=np.float64
         )
-        # Caches (weight-independent)
+        # Permanent caches (weight-independent) ---------------------------
         self._viol_cache: dict[tuple[str, str], np.ndarray] = {}
         self._cand_cache: dict[str, set[str]] = {}
-        # Harmony cache: {(ur, sr) → float}.  Valid between weight updates;
-        # cleared by run_weight_update() since harmony = w · viol_vec changes
-        # with weights.  Replaces np.dot per call with a dict lookup.
-        self._harmony_cache: dict[tuple[str, str], float] = {}
+        # Per-UR violation matrix: ur → ndarray of shape (n_cands, n_constraints).
+        # Built on first access; rows are appended when a new SR is encountered.
+        self._viol_matrix_cache: dict[str, np.ndarray] = {}
+        # ur → {sr: row_index} — maps each candidate SR to its row in the matrix.
+        self._cand_to_row: dict[str, dict[str, int]] = {}
+        # Weight-dependent cache (cleared after each weight update) --------
+        # ur → H(ur, *) = V_ur @ w, shape (n_cands,).  Avoids recomputing the
+        # matmul on every log_prob call within the same sweep.
+        self._harmonies_cache: dict[str, np.ndarray] = {}
         # Accumulated (ur, sr) observation counts for the next weight update.
         # Counter deduplicates: identical pairs across tokens/sweeps are stored
         # once and multiplied by count in the gradient, so memory is O(unique pairs)
@@ -176,15 +196,10 @@ class MaxEntPhonology:
     def harmony(self, ur: str, sr: str) -> float:
         """H(ur, sr) = w · violations(ur, sr).  Higher = more marked.
 
-        Results are cached between MaxEnt weight updates.  The cache is
-        cleared by run_weight_update() since harmony values depend on weights.
+        Kept for external introspection.  log_prob() and fit_weights() use
+        the vectorized _harmonies_cache path instead of calling this directly.
         """
-        key = (ur, sr)
-        if key not in self._harmony_cache:
-            self._harmony_cache[key] = float(
-                np.dot(self.weights, self.violation_vector(ur, sr))
-            )
-        return self._harmony_cache[key]
+        return float(np.dot(self.weights, self.violation_vector(ur, sr)))
 
     def _candidates(self, ur: str) -> set[str]:
         if ur not in self._cand_cache:
@@ -192,19 +207,66 @@ class MaxEntPhonology:
             self._cand_cache[ur] = candidates_for(ur, self.alphabet, rng=self._rng)
         return self._cand_cache[ur]
 
+    def _ensure_cand_matrix(self, ur: str, sr: str) -> tuple[np.ndarray, int]:
+        """Return (V_ur, sr_row_idx) for vectorized scoring.
+
+        V_ur has shape (n_cands, n_constraints).  Built on first call for a
+        given UR from its cached candidate set.  If sr is not already in the
+        candidate set, a new row is appended (rare: only when an observed SR
+        falls outside the random candidate sample).
+
+        Weight-independent — safe to call during L-BFGS-B optimization.
+        """
+        if ur not in self._cand_to_row:
+            cands = sorted(self._candidates(ur))
+            self._cand_to_row[ur] = {c: i for i, c in enumerate(cands)}
+            if cands:
+                self._viol_matrix_cache[ur] = np.stack(
+                    [self.violation_vector(ur, c) for c in cands]
+                )
+            else:
+                self._viol_matrix_cache[ur] = np.empty(
+                    (0, len(self.constraints)), dtype=np.float64
+                )
+
+        cand_to_row = self._cand_to_row[ur]
+        if sr not in cand_to_row:
+            # SR not in the sampled candidate set — append a row.
+            # Also invalidate the harmonies cache for this UR since the matrix grew.
+            idx = len(cand_to_row)
+            cand_to_row[sr] = idx
+            new_row = self.violation_vector(ur, sr)[np.newaxis, :]
+            self._viol_matrix_cache[ur] = np.vstack(
+                [self._viol_matrix_cache[ur], new_row]
+            )
+            self._harmonies_cache.pop(ur, None)
+
+        return self._viol_matrix_cache[ur], self._cand_to_row[ur][sr]
+
     def log_prob(self, ur: str, sr: str) -> float:
         """log P(SR | UR) = -H(ur, sr) - log Z(ur).
 
+        Vectorized: computes H for all candidates as V_ur @ w in one matmul,
+        then caches the result per UR until the next weight update.
+
         If identity_only=True, returns 0.0 when ur==sr and -inf otherwise,
-        bypassing all constraint scoring.  Use this to test the segmenter
-        independently of the phonological grammar.
+        bypassing all constraint scoring.
         """
         if self.identity_only:
             return 0.0 if ur == sr else float("-inf")
-        cands = self._candidates(ur)
-        cands = cands | {sr}  # always include the observed SR
-        log_z = logsumexp([-self.harmony(ur, c) for c in cands])
-        return -self.harmony(ur, sr) - log_z
+
+        V, sr_idx = self._ensure_cand_matrix(ur, sr)
+
+        if ur not in self._harmonies_cache:
+            self._harmonies_cache[ur] = V @ self.weights   # (n_cands,)
+        harmonies = self._harmonies_cache[ur]
+
+        # Numerically stable logsumexp over -harmonies
+        neg_h = -harmonies
+        m = neg_h.max()
+        log_z = float(m + np.log(np.sum(np.exp(neg_h - m))))
+
+        return float(-harmonies[sr_idx] - log_z)
 
     # ------------------------------------------------------------------
     # Weight learning
@@ -219,6 +281,9 @@ class MaxEntPhonology:
 
         Minimises:  -log-likelihood  +  half-normal prior penalty
         Clears the accumulation buffer after the update.
+
+        Vectorized: for each unique UR, harmonies = V_ur @ w and expected
+        violations = softmax(-harmonies) @ V_ur are both single matmuls.
         """
         if not self._accumulated:
             return
@@ -227,16 +292,26 @@ class MaxEntPhonology:
         pair_counts: dict[tuple[str, str], int] = dict(self._accumulated)
         self._accumulated.clear()
 
-        # Pre-compute violation vectors and candidate sets.
-        # When the same UR appears with multiple SRs (e.g. in allomorphic pairs),
-        # union all observed SRs into the candidate set for that UR so that
-        # the partition function Z(ur) is computed over all attested outputs.
-        all_cands: dict[str, set[str]] = {}
-        obs_viols: dict[tuple[str, str], np.ndarray] = {}
-        for ur, sr in pair_counts:
-            base_cands = self._candidates(ur)
-            all_cands[ur] = all_cands.get(ur, base_cands) | {sr}
-            obs_viols[(ur, sr)] = self.violation_vector(ur, sr)
+        # Group observed counts by UR so each UR's violation matrix is
+        # accessed once per L-BFGS-B iteration, not once per observation.
+        ur_to_sr_counts: dict[str, dict[str, int]] = {}
+        for (ur, sr), count in pair_counts.items():
+            ur_to_sr_counts.setdefault(ur, {})[sr] = (
+                ur_to_sr_counts.get(ur, {}).get(sr, 0) + count
+            )
+
+        # Ensure all violation matrices are built before the optimizer runs
+        # (avoids side-effects inside the closure).
+        for ur, sr_counts in ur_to_sr_counts.items():
+            for sr in sr_counts:
+                self._ensure_cand_matrix(ur, sr)
+
+        # Snapshot of observed violation vectors (weight-independent).
+        obs_viols: dict[tuple[str, str], np.ndarray] = {
+            (ur, sr): self.violation_vector(ur, sr)
+            for ur, sr_counts in ur_to_sr_counts.items()
+            for sr in sr_counts
+        }
 
         # Prior σ per constraint (from P-map initialisation)
         prior_sigma = np.array([c.prior_weight for c in self.constraints], dtype=np.float64)
@@ -247,24 +322,35 @@ class MaxEntPhonology:
 
             Returns (scalar_loss, gradient_vector).
             L-BFGS-B minimises, so we return -log P(w | data).
+
+            Vectorized inner loop:
+              harmonies  = V_ur @ w                    one matmul per unique UR
+              probs      = softmax(-harmonies)          one exp + normalise
+              exp_viols  = probs @ V_ur                 one matmul per unique UR
             """
             total_nll = 0.0
             grad = np.zeros_like(w)
-            for (ur, sr), count in pair_counts.items():
-                obs_v = obs_viols[(ur, sr)]
-                cands = all_cands[ur]
-                # Harmony H(ur, c) = w · violations(ur, c)  for each candidate c
-                harm = {c: float(np.dot(w, self.violation_vector(ur, c))) for c in cands}
-                # log Z(ur) = log Σ_c exp(-H(ur,c))
-                log_z = logsumexp([-h for h in harm.values()])
-                # neg log-likelihood contribution, weighted by observation count
-                total_nll += count * (harm[sr] + log_z)
-                # MaxEnt gradient: count × (observed violations − expected violations)
-                # E[violations] = Σ_c P(c|ur,w) · violations(ur,c)
-                exp_viols = np.zeros(len(self.constraints))
-                for c, h in harm.items():
-                    exp_viols += np.exp(-h - log_z) * self.violation_vector(ur, c)
-                grad += count * (obs_v - exp_viols)
+
+            for ur, sr_counts in ur_to_sr_counts.items():
+                V = self._viol_matrix_cache[ur]       # (n_cands, n_constraints)
+                cand_to_row = self._cand_to_row[ur]
+
+                harmonies = V @ w                      # (n_cands,)
+                neg_h = -harmonies
+                m = neg_h.max()
+                exp_neg_h = np.exp(neg_h - m)
+                z = exp_neg_h.sum()
+                log_z = float(m + np.log(z))
+                probs = exp_neg_h / z                  # (n_cands,) — softmax
+
+                # Expected violations: one matmul replaces a per-candidate loop
+                exp_viols = probs @ V                  # (n_constraints,)
+
+                for sr, count in sr_counts.items():
+                    sr_idx = cand_to_row[sr]
+                    total_nll += count * (harmonies[sr_idx] + log_z)
+                    # Gradient: count × (observed − expected) violations
+                    grad += count * (obs_viols[(ur, sr)] - exp_viols)
 
             # Half-normal prior penalty: Σ w_i² / (2σ_i²)  (σ_i = P-map prior weight)
             prior_nll = float(np.sum(w**2 / (2 * prior_sigma**2)))
@@ -282,9 +368,9 @@ class MaxEntPhonology:
             options={"maxiter": 200, "ftol": 1e-9},
         )
         self.weights = result.x
-        # Harmony values depend on weights: clear cache after each update.
-        # Violation vectors are weight-independent and are NOT cleared.
-        self._harmony_cache.clear()
+        # Harmonies depend on weights: clear cache after each update.
+        # Violation matrices are weight-independent and are NOT cleared.
+        self._harmonies_cache.clear()
 
     # ------------------------------------------------------------------
     # Extensibility hook: weight_updater swap-in point

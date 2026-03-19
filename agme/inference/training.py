@@ -190,7 +190,8 @@ def run_training(
             print(
                 f"Sweep {sweep + 1}/{n_sweeps} | "
                 f"UR types: {n_types} | "
-                f"Top weights: {top_str}"
+                f"Top weights: {top_str}",
+                flush=True,
             )
 
     # Normalise posterior
