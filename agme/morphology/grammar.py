@@ -126,6 +126,16 @@ class MorphologicalGrammar:
             self.caches[cls].remove(ur)
             self.base_dists[cls].update_counts(ur, delta=-1.0)
 
+    def add_parse_n(self, parse: list[tuple[str, str]], n: int) -> None:
+        """Add a parse n times (for type-level inference)."""
+        for _ in range(n):
+            self.add_parse(parse)
+
+    def remove_parse_n(self, parse: list[tuple[str, str]], n: int) -> None:
+        """Remove a parse n times (for type-level inference)."""
+        for _ in range(n):
+            self.remove_parse(parse)
+
     # ------------------------------------------------------------------
     # Introspection
     # ------------------------------------------------------------------

@@ -94,6 +94,7 @@ class MaxEntPhonology:
         alphabet: list[str],
         identity_only: bool = False,
         rng: np.random.Generator | None = None,
+        max_sr_candidates: int = 50,
     ) -> None:
         self.constraints = constraints
         self.alphabet = alphabet
@@ -103,6 +104,10 @@ class MaxEntPhonology:
         # Seeded RNG passed from Model.fit() — used in candidates_for() so
         # that the random multi-edit candidate set is deterministic given seed.
         self._rng = rng
+        # Maximum number of SR candidates per UR kept in the violation matrix.
+        # Candidates are pruned to the top-max_sr_candidates by P-map prior
+        # harmony (EC-2).  0 = no limit.
+        self.max_sr_candidates = max_sr_candidates
         # Weights in constraint order (w ≥ 0 enforced during learning)
         self.weights: np.ndarray = np.array(
             [c.prior_weight for c in constraints], dtype=np.float64
@@ -222,12 +227,28 @@ class MaxEntPhonology:
         """
         if ur not in self._cand_to_row:
             cands = sorted(self._candidates(ur))
-            self._cand_to_row[ur] = {c: i for i, c in enumerate(cands)}
             if cands:
-                self._viol_matrix_cache[ur] = np.stack(
-                    [self.violation_vector(ur, c) for c in cands]
-                )
+                viol_rows = [self.violation_vector(ur, c) for c in cands]
+                if self.max_sr_candidates and len(cands) > self.max_sr_candidates:
+                    # Prune to top-N by P-map prior harmony (EC-2).
+                    # Use prior_weight (not current weights) so the candidate
+                    # set is stable across weight updates.
+                    prior_w = np.array(
+                        [c.prior_weight for c in self.constraints],
+                        dtype=np.float64,
+                    )
+                    prior_harmonies = np.fromiter(
+                        (float(prior_w @ v) for v in viol_rows),
+                        dtype=np.float64,
+                        count=len(viol_rows),
+                    )
+                    keep = np.argsort(prior_harmonies)[: self.max_sr_candidates]
+                    cands = [cands[i] for i in keep]
+                    viol_rows = [viol_rows[i] for i in keep]
+                self._cand_to_row[ur] = {c: i for i, c in enumerate(cands)}
+                self._viol_matrix_cache[ur] = np.stack(viol_rows)
             else:
+                self._cand_to_row[ur] = {}
                 self._viol_matrix_cache[ur] = np.empty(
                     (0, len(self.constraints)), dtype=np.float64
                 )
@@ -273,9 +294,9 @@ class MaxEntPhonology:
     # Weight learning
     # ------------------------------------------------------------------
 
-    def accumulate(self, ur: str, sr: str) -> None:
-        """Record a (ur, sr) observation for the next weight update."""
-        self._accumulated[(ur, sr)] += 1
+    def accumulate(self, ur: str, sr: str, count: int = 1) -> None:
+        """Record count observations of (ur, sr) for the next weight update."""
+        self._accumulated[(ur, sr)] += count
 
     def fit_weights(self, learning_rate: float = 1.0) -> None:
         """Update weights via L-BFGS-B on the accumulated (ur, sr) pairs.
