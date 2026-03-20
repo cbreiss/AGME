@@ -6,6 +6,10 @@ logsumexp(log_vals)
     Numerically stable log-sum-exp; used everywhere a distribution over
     log-probabilities needs to be normalised.
 
+levenshtein_distance(s, t)
+    Edit distance only (no traceback).  O(min(m,n)) space.  Used for
+    cheap candidate pruning before full violation_vector computation.
+
 levenshtein_alignment(s, t)
     Optimal character alignment of two strings (UR vs SR).  The result is
     consumed by StarMapConstraint.violations() to identify which segments
@@ -30,6 +34,27 @@ def logsumexp(log_vals: list[float]) -> float:
     if not np.isfinite(m):
         return float("-inf")
     return float(m + np.log(np.sum(np.exp(arr - m))))
+
+
+def levenshtein_distance(s: str, t: str) -> int:
+    """Edit distance between *s* and *t* (no traceback).
+
+    Uses a two-row DP so memory is O(min(m, n)).  Much cheaper than
+    levenshtein_alignment because no path reconstruction is needed.
+    Used as a proxy for P-map harmony when pruning SR candidate sets.
+    """
+    m, n = len(s), len(t)
+    if m < n:                       # ensure m >= n for the shorter row
+        s, t, m, n = t, s, n, m
+    prev = list(range(n + 1))
+    for i in range(1, m + 1):
+        curr = [i] + [0] * n
+        si = s[i - 1]
+        for j in range(1, n + 1):
+            cost = 0 if si == t[j - 1] else 1
+            curr[j] = min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost)
+        prev = curr
+    return prev[n]
 
 
 def levenshtein_alignment(s: str, t: str) -> list[tuple[str | None, str | None]]:

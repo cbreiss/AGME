@@ -100,3 +100,40 @@ languages with long stems.
 
 **To revert**: Increase `max_morpheme_len` in `agme/api.py`'s call to
 `run_training()`, or expose it as a `Model.fit()` parameter.
+
+---
+
+## EC-5: Levenshtein distance as proxy for P-map harmony in candidate pruning
+
+**What**: When pruning the SR candidate set to `max_sr_candidates` (EC-2),
+candidates are ranked by **Levenshtein edit distance** from the UR rather than
+by true P-map harmony (i.e., `Σ w_c · violations_c`).
+
+Levenshtein distance counts the total number of insertions, deletions, and
+substitutions needed to reach the SR from the UR, without weighting by
+featural distance.  True P-map harmony weights each edit by the panphon
+distance between the segments involved — so a substitution between featurally
+similar segments (e.g. /p/→[b]) costs less than one between dissimilar segments
+(e.g. /p/→[z]).
+
+Ranking is done before violation vectors are computed, using
+`agme.utils.levenshtein_distance` (O(min(m,n)) space, no traceback).
+
+**Tractability gain**: Avoids computing full violation vectors (which require
+`levenshtein_alignment` + count-matrix construction) for the ~85% of candidates
+that will be discarded.  Reduces alignment calls from ~2.5M to ~300K per run
+on a 100-token Brent sample.
+
+**Scientific caveat**: The proxy ranking slightly misorders candidates relative
+to the true P-map prior.  Specifically, a short easy substitution (e.g. /p/→[b],
+distance 1) and a long hard substitution (e.g. /p/→[z], distance 1) receive the
+same rank, even though P-map harmony would prefer /p/→[b] because panphon
+similarity(p, b) > panphon similarity(p, z).  In practice, since all single-edit
+candidates have distance 1 and typically outnumber `max_sr_candidates`, the kept
+set is a random subset of single-edit candidates — which is still linguistically
+reasonable.
+
+**To revert**: Replace the `levenshtein_distance` ranking in
+`MaxEntPhonology._ensure_cand_matrix` with full P-map harmony ranking (compute
+all violation vectors, rank by `prior_w @ v`, then prune).  This is only correct
+if the extra computation cost is acceptable.

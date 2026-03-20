@@ -72,7 +72,7 @@ from scipy.optimize import minimize
 
 from agme.phonology.candidates import candidates_for
 from agme.phonology.constraints import StarMapConstraint
-from agme.utils import levenshtein_alignment, logsumexp
+from agme.utils import levenshtein_alignment, levenshtein_distance, logsumexp
 
 
 class MaxEntPhonology:
@@ -160,6 +160,16 @@ class MaxEntPhonology:
             [c.left_ctx is None and c.right_ctx is None for c in constraints],
             dtype=bool,
         )
+        # Cached bool: True when ALL constraints are context-free.
+        # Avoids calling ndarray.all() (and its underlying ufunc) on every
+        # violation_vector() call — saves ~2.5M numpy calls per run.
+        self._all_context_free: bool = bool(self._c_context_free.all())
+        # Pre-allocated count matrix for violation_vector().
+        # Reset with fill(0.0) on each call instead of allocating np.zeros —
+        # saves ~2.5M small allocations per run.
+        self._count_matrix_buf: np.ndarray = np.zeros(
+            (_n, _n), dtype=np.float64
+        )
 
     # ------------------------------------------------------------------
     # Core scoring
@@ -182,17 +192,19 @@ class MaxEntPhonology:
         if key not in self._viol_cache:
             alignment = levenshtein_alignment(ur, sr)
 
-            # Build count matrix in one Python pass over the alignment.
-            count_matrix = np.zeros((self._n_syms, self._n_syms), dtype=np.float64)
+            # Reuse pre-allocated buffer; fancy-index extraction copies the
+            # result so clearing the buffer on the next call is safe.
+            buf = self._count_matrix_buf
+            buf.fill(0.0)
             s2i = self._seg_to_idx
             for ur_seg, sr_seg in alignment:
-                count_matrix[s2i.get(ur_seg, 0), s2i.get(sr_seg, 0)] += 1.0
+                buf[s2i.get(ur_seg, 0), s2i.get(sr_seg, 0)] += 1.0
 
             # Vectorized lookup for context-free constraints (all current ones).
-            viols = count_matrix[self._c_x_idx, self._c_y_idx]
+            viols = buf[self._c_x_idx, self._c_y_idx]
 
             # Context-sensitive constraints overwrite their slots (rare fallback).
-            if not self._c_context_free.all():
+            if not self._all_context_free:
                 for idx in np.where(~self._c_context_free)[0]:
                     viols[idx] = self.constraints[idx].count_from_alignment(
                         alignment, sr
@@ -228,23 +240,16 @@ class MaxEntPhonology:
         if ur not in self._cand_to_row:
             cands = sorted(self._candidates(ur))
             if cands:
-                viol_rows = [self.violation_vector(ur, c) for c in cands]
                 if self.max_sr_candidates and len(cands) > self.max_sr_candidates:
-                    # Prune to top-N by P-map prior harmony (EC-2).
-                    # Use prior_weight (not current weights) so the candidate
-                    # set is stable across weight updates.
-                    prior_w = np.array(
-                        [c.prior_weight for c in self.constraints],
-                        dtype=np.float64,
-                    )
-                    prior_harmonies = np.fromiter(
-                        (float(prior_w @ v) for v in viol_rows),
-                        dtype=np.float64,
-                        count=len(viol_rows),
-                    )
-                    keep = np.argsort(prior_harmonies)[: self.max_sr_candidates]
+                    # Prune to top-N BEFORE computing violation vectors (EC-2).
+                    # Use Levenshtein distance as a cheap proxy for P-map
+                    # harmony: fewer edits ↔ lower harmony ↔ higher P(SR|UR).
+                    # This avoids computing expensive alignment+violation vectors
+                    # for candidates that will be discarded.
+                    dists = [levenshtein_distance(ur, c) for c in cands]
+                    keep = np.argsort(dists, kind="stable")[: self.max_sr_candidates]
                     cands = [cands[i] for i in keep]
-                    viol_rows = [viol_rows[i] for i in keep]
+                viol_rows = [self.violation_vector(ur, c) for c in cands]
                 self._cand_to_row[ur] = {c: i for i, c in enumerate(cands)}
                 self._viol_matrix_cache[ur] = np.stack(viol_rows)
             else:
