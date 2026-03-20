@@ -21,7 +21,7 @@ from agme import Model
 from klattbet import KLATTBET_TO_IPA
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-N_TYPES   = 100   # unique word types to train on
+N_TYPES   = 100   # number of tokens to sample (regardless of type count)
 N_SWEEPS  = 30    # enough to get meaningful profile data
 BURN_IN   = 10
 SEED      = 42
@@ -29,19 +29,17 @@ OUTPUT    = "profile_brent_results.txt"
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-def load_random_sample(path: str, n: int, seed: int) -> list[str]:
-    """Return tokens for n randomly-sampled unique surface types."""
+def load_random_tokens(path: str, n: int, seed: int) -> list[str]:
+    """Return n randomly-sampled tokens (not types) from the corpus."""
     import random
     rng = random.Random(seed)
     with open(path, encoding="utf-8") as f:
         tokens = [line.strip() for line in f if line.strip()]
-    all_types = list(set(tokens))
-    sampled_types = set(rng.sample(all_types, min(n, len(all_types))))
-    return [t for t in tokens if t in sampled_types]
+    return rng.sample(tokens, min(n, len(tokens)))
 
 
 def run():
-    surfaces = load_random_sample("data/words_train.txt", N_TYPES, SEED)
+    surfaces = load_random_tokens("data/words_train.txt", N_TYPES, SEED)
     n_unique = len(set(surfaces))
     alphabet_size = len(set("".join(surfaces)))
     print(f"Loaded {len(surfaces)} tokens, {n_unique} unique types, "
@@ -60,7 +58,7 @@ def run():
         n_sweeps=N_SWEEPS,
         burn_in=BURN_IN,
         maxent_update_every=5,
-        print_every=5,          # show sweep progress (negligible profiling overhead)
+        print_every=1,          # flush after every sweep so progress is visible
         seed=SEED,
     )
 
