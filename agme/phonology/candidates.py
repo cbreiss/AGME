@@ -44,7 +44,7 @@ def candidates_for(
     ur: str,
     alphabet: list[str],
     max_length_delta: int = 2,
-    n_random: int = 30,
+    n_random: int = 5,
     rng: np.random.Generator | None = None,
 ) -> set[str]:
     """Return candidate SRs for the given UR.

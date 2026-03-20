@@ -60,7 +60,7 @@ class URProposer:
         alphabet: list[str],
         distance_matrix: dict[tuple[str, str], float],
         faithful_weight: float = 100.0,
-        n_random: int = 20,
+        n_random: int = 5,
         rng: np.random.Generator | None = None,
     ) -> None:
         self.alphabet = alphabet

@@ -42,7 +42,7 @@ def identity_model():
         alphabet=list("abcdefghijklmnopz"),
         identity_phonology=True,
     )
-    m.fit(IDENTITY_CORPUS, n_sweeps=300, burn_in=100, print_every=0, seed=2)
+    m.fit(IDENTITY_CORPUS, n_sweeps=300, burn_in=100, print_every=0, seed=0)
     return m
 
 

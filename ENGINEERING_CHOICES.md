@@ -137,3 +137,33 @@ reasonable.
 `MaxEntPhonology._ensure_cand_matrix` with full P-map harmony ranking (compute
 all violation vectors, rank by `prior_w @ v`, then prune).  This is only correct
 if the extra computation cost is acceptable.
+
+---
+
+## EC-6: Reduced random multi-edit candidates (n_random = 5)
+
+**What**: Both the SR candidate generator (`candidates_for` in
+`agme/phonology/candidates.py`) and the UR proposer (`URProposer` in
+`agme/inference/ur_proposer.py`) include a small number of random multi-edit
+candidates to improve mixing beyond the single-edit neighbourhood.  The default
+was 30 (SR candidates) and 20 (UR proposer); both are reduced to **5**.
+
+**Tractability gain**: Reduces `random_edit` calls from ~992K to ~250K per run
+(~4× reduction), saving ~6s on 100 tokens.  Also shrinks the pre-pruning
+candidate set for each UR from ~420 to ~395, slightly reducing the
+`levenshtein_distance` calls in `_ensure_cand_matrix` during cold start.
+
+**Scientific caveat**: Random multi-edit candidates are the only way the model
+can propose SR candidates (or UR hypotheses) that differ from the observed form
+by more than one edit — e.g., a stem with both a deletion and a substitution, or
+a UR that requires two simultaneous changes to reach the SR.  Reducing from 20–30
+to 5 makes it less likely that the sampler explores such candidates in any given
+sweep.  For languages with simple phonology (Brent corpus, English plurals) this
+is harmless.  For languages with complex multi-step alternations (e.g. vowel
+harmony + consonant mutation), the reduced exploration could slow convergence or
+miss valid parse hypotheses.
+
+**Parameters**: `candidates_for(n_random=5)` and `URProposer(n_random=5)`.
+
+**To revert**: Increase `n_random` in both call sites, or expose it as a
+`Model.fit()` parameter.
