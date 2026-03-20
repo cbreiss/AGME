@@ -68,6 +68,40 @@ class URProposer:
         self.faithful_weight = faithful_weight
         self.n_random = n_random
         self.rng = rng or np.random.default_rng()
+        # Cache of pre-computed single-edit candidates + weights per SR span.
+        # Single-edit weights depend only on (sr_span, candidate, alphabet,
+        # distance_matrix) — not on the lexicon or sweep count — so they are
+        # identical every time the same SR span appears.  With type-level
+        # inference each span string recurs every sweep, so after the first
+        # encounter (first sweep) all subsequent propose() calls for that span
+        # skip the O(len × |alph|) _edit_weight enumeration entirely.
+        self._single_edit_cache: dict[str, list[tuple[str, float]]] = {}
+
+    def _precompute_single_edits(self, sr_span: str) -> list[tuple[str, float]]:
+        """Return (candidate, weight) for all single-edit neighbours of sr_span.
+
+        Result is cached permanently — weights depend only on the SR span,
+        the alphabet, and the distance matrix, none of which change during
+        training.
+        """
+        if sr_span not in self._single_edit_cache:
+            results: list[tuple[str, float]] = []
+            for i in range(len(sr_span)):
+                for c in self.alphabet:
+                    if c != sr_span[i]:
+                        cand = sr_span[:i] + c + sr_span[i + 1:]
+                        results.append((cand, self._edit_weight(sr_span, cand)))
+                # Deletion
+                cand = sr_span[:i] + sr_span[i + 1:]
+                if cand:
+                    results.append((cand, self._edit_weight(sr_span, cand)))
+            # Insertions
+            for i in range(len(sr_span) + 1):
+                for c in self.alphabet:
+                    cand = sr_span[:i] + c + sr_span[i:]
+                    results.append((cand, self._edit_weight(sr_span, cand)))
+            self._single_edit_cache[sr_span] = results
+        return self._single_edit_cache[sr_span]
 
     def _edit_weight(self, sr: str, ur_candidate: str) -> float:
         """Proposal weight proportional to 1 / (pmap_cost + ε)."""
@@ -108,21 +142,9 @@ class URProposer:
             w = self._edit_weight(sr_span, ur) * (count ** 0.5)
             candidates[ur] = candidates.get(ur, 0.0) + w
 
-        # 3. Single-operation edits of the SR
-        for i in range(len(sr_span)):
-            for c in self.alphabet:
-                if c != sr_span[i]:
-                    cand = sr_span[:i] + c + sr_span[i + 1:]
-                    candidates[cand] = candidates.get(cand, 0.0) + self._edit_weight(sr_span, cand)
-            # Deletion
-            cand = sr_span[:i] + sr_span[i + 1:]
-            if cand:
-                candidates[cand] = candidates.get(cand, 0.0) + self._edit_weight(sr_span, cand)
-        # Insertions
-        for i in range(len(sr_span) + 1):
-            for c in self.alphabet:
-                cand = sr_span[:i] + c + sr_span[i:]
-                candidates[cand] = candidates.get(cand, 0.0) + self._edit_weight(sr_span, cand)
+        # 3. Single-operation edits of the SR (cached per span)
+        for cand, w in self._precompute_single_edits(sr_span):
+            candidates[cand] = candidates.get(cand, 0.0) + w
 
         # 4. Random multi-edit candidates
         for _ in range(self.n_random):

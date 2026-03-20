@@ -23,12 +23,44 @@ weights using Hamiltonian Monte Carlo.  The hook is already stubbed — swap
 `fit_weights` for an HMC sampler.  Relevant for quantifying uncertainty in
 learned *MAP weights and for the production/RT modeling extension below.
 
-### FST-based exact partition function
-**Where:** `agme/phonology/candidates.py` (DECISION POINT note)
-Currently Z(UR) is approximated by summing over a finite candidate set.
-An exact computation via pynini (log-semiring WFST compose + shortestdistance)
-would remove the approximation error.  Optional dependency; pure-Python
-fallback stays as-is.
+### FST-based phonological grammar (architecture upgrade)
+**Where:** `agme/phonology/candidates.py` (DECISION POINT note), `agme/inference/ur_proposer.py`
+
+Currently the phonological grammar approximates Z(UR) over a finite candidate
+set, and the UR proposer enumerates single-edit neighbours of the SR span.
+Both are workarounds for the same underlying problem: we lack an efficient way
+to score and sample from P(SR|UR) without explicitly enumerating candidates.
+
+**What FSTs would replace:**
+- `candidates_for()` + `_viol_matrix_cache` — the SR enumeration + violation
+  matrix machinery is no longer needed; the WFST arc weights encode exactly
+  the same information
+- `URProposer._precompute_single_edits()` — replaced by composing the SR span
+  with the inverse transducer to get a weighted set of UR candidates; no
+  `_edit_weight` enumeration at all
+- The approximate Z(UR) — `pynini.shortestdistance` gives the exact partition
+  function via the log-semiring in one pass
+
+**What the WFST looks like:**
+The MaxEnt *MAP grammar compiles to a small edit transducer (~1,520 arcs for a
+38-symbol alphabet): one arc per ordered (x, y) segment pair with weight
+`−w_{*MAP(x,y)}`, plus self-loops (weight 0) for identity correspondences.
+After each MaxEnt weight update, arc weights are updated in-place — no
+recompile needed.  Forward composition gives P(SR|UR); inverse composition
+gives P(UR|SR) for the proposer.
+
+**Overhead costs:**
+- pynini (Google/OpenFst wrapper) has no official Windows wheels; installation
+  requires building OpenFst from source or using a conda-forge build.  hfst is
+  an alternative with better Windows support but a less Pythonic API.
+- Significant architectural restructuring of `MaxEntPhonology` and `URProposer`.
+- FST composition per span is fast in C++ but slower than a cached matmul on a
+  cache hit; the benefit is exact Z and eliminating all candidate enumeration.
+
+**When to do it:** when (a) distributing to collaborators who need exact
+phonological scores, (b) implementing the production/RT modeling extension
+(which needs exact P(SR|UR) for novel URs), or (c) profiling confirms that
+candidate enumeration remains a bottleneck after other fixes.
 
 ### Context-sensitive \*MAP constraints
 **Where:** `agme/phonology/constraints.py:210`
