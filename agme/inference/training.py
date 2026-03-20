@@ -145,6 +145,70 @@ def run_training(
         state.parses[sf] = initial_parse
         morph_grammar.add_parse_n([(sf, stem_cls)], n)
 
+    # ------------------------------------------------------------------
+    # Warm-up: pre-populate caches before sweep 1.
+    #
+    # During sweep 1 every (sr_span, ur) pair is encountered for the first
+    # time, triggering expensive cold-start work:
+    #   - URProposer._precompute_single_edits(span) — O(len × |alph|) calls
+    #     to _edit_weight for every unique SR span
+    #   - MaxEntPhonology._ensure_cand_matrix(ur, span) — levenshtein_distance
+    #     + violation_vector for every candidate of every UR
+    #
+    # Both caches are purely read-only w.r.t. the PYP, so they can be built
+    # before any Gibbs sweep without affecting statistical correctness.
+    #
+    # We warm up using an EMPTY morpheme lexicon (ignore initial parses).
+    # This covers all single-edit UR candidates (the majority of sweep-1
+    # cache misses).  Lexicon-based UR proposals (from PYP entries) may
+    # still cold-start during sweep 1, but there are very few of them.
+    #
+    # Future extension: parallelise over unique_spans with
+    # multiprocessing.Pool to bring cold-start time down further.
+    # ------------------------------------------------------------------
+    _t_warm = _time.perf_counter()
+    unique_spans: set[str] = set()
+    for sf in type_counts:
+        n_sf = len(sf)
+        for i in range(n_sf):
+            for j in range(i + 1, min(i + max_morpheme_len + 1, n_sf + 1)):
+                unique_spans.add(sf[i:j])
+
+    if print_every > 0:
+        print(
+            f"Warm-up: {len(unique_spans)} unique spans "
+            f"({len(type_counts)} types)...",
+            end=" ",
+            flush=True,
+        )
+
+    # Temporarily disable random multi-edit proposals so warm-up does not
+    # consume any RNG samples and therefore does not shift the training seed.
+    # (Single-edit candidates dominate the top-k anyway and are the main
+    # cache-miss source.)
+    #
+    # We also save/restore the full RNG bit-generator state because
+    # _ensure_cand_matrix → candidates_for(rng=...) may consume RNG samples
+    # even with proposer.n_random = 0 (the SR candidate generator has its own
+    # n_random drawn from the same RNG).  Restoring the state makes the
+    # warm-up completely transparent: training sweep 1 sees the identical RNG
+    # state it would have seen without any warm-up.
+    _rng_state = rng.bit_generator.state
+    _saved_n_random = proposer.n_random
+    proposer.n_random = 0
+    for span in unique_spans:
+        # Proposer cache: single-edit candidates + weights for this span
+        proposer._precompute_single_edits(span)
+        # Phonology cache: violation matrices for the UR candidates this span
+        # would generate (empty lexicon + no random edits)
+        for ur, _ in proposer.propose(span, {}, top_k=top_k_urs):
+            phon_grammar._ensure_cand_matrix(ur, span)
+    proposer.n_random = _saved_n_random
+    rng.bit_generator.state = _rng_state
+
+    if print_every > 0:
+        print(f"done ({_time.perf_counter() - _t_warm:.1f}s)", flush=True)
+
     for sweep in range(n_sweeps):
         state.sweep_count = sweep
 

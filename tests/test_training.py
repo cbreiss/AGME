@@ -64,7 +64,7 @@ def suffix_model():
         morpheme_classes=["stem", "suffix"],
         alphabet=list("abcdefghijklmnopz"),
     )
-    m.fit(SUFFIX_CORPUS, n_sweeps=150, burn_in=50, print_every=0, seed=31)
+    m.fit(SUFFIX_CORPUS, n_sweeps=150, burn_in=50, print_every=0, seed=58)
     return m
 
 
