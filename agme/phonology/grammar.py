@@ -420,8 +420,8 @@ class MaxEntPhonology:
             prior_nll = float(np.sum((w - prior_mu) ** 2 / (2 * sigma2)))
             prior_grad = (w - prior_mu) / sigma2
 
-            # We minimise -log posterior; negate the log-likelihood gradient
-            return total_nll + prior_nll, -grad + prior_grad
+            # We minimise -log posterior; grad = ∂NLL/∂w, prior_grad = ∂prior/∂w
+            return total_nll + prior_nll, grad + prior_grad
 
         result = minimize(
             neg_log_posterior,

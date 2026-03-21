@@ -35,7 +35,7 @@ OUT = Path("data")
 # Maximum number of word TYPES to include (by token frequency).
 # Set to None to include all types.  500 is large enough to capture the main
 # morphological patterns while keeping AGME training tractable (<10 min).
-N_WORDS = 500
+N_WORDS = None
 
 
 # ---------------------------------------------------------------------------
