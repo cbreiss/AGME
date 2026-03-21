@@ -52,10 +52,13 @@ Weight learning
 ---------------
 Weights are updated via fit_weights() using L-BFGS-B (scipy).
 The objective is negative log-posterior:
-    -log P(w | data) = Σ H(ur, sr) + log Z(ur)   [neg log-likelihood]
-                     + Σ w_c² / (2σ_c²)           [half-normal prior]
-where σ_c = prior_weight of constraint c (from panphon distance).
-The w ≥ 0 constraint is enforced via L-BFGS-B bounds.
+    -log P(w | data) = Σ H(ur, sr) + log Z(ur)        [neg log-likelihood]
+                     + Σ (w_c − μ_c)² / (2σ²)         [normal prior]
+where μ_c = prior_weight of constraint c (the P-map target the regulariser
+contracts toward) and σ is a single fixed width shared across all constraints
+(set via prior_sigma; default 1.0).  Weights are constrained w ≥ 0 by the
+L-BFGS-B bounds; the prior gradient at the boundary is (0 − μ_c)/σ², which
+actively pushes weights up toward the P-map target rather than toward zero.
 
 Extensibility
 -------------
@@ -95,6 +98,7 @@ class MaxEntPhonology:
         identity_only: bool = False,
         rng: np.random.Generator | None = None,
         max_sr_candidates: int = 50,
+        prior_sigma: float = 1.0,
     ) -> None:
         self.constraints = constraints
         self.alphabet = alphabet
@@ -108,10 +112,17 @@ class MaxEntPhonology:
         # Candidates are pruned to the top-max_sr_candidates by P-map prior
         # harmony (EC-2).  0 = no limit.
         self.max_sr_candidates = max_sr_candidates
-        # Weights in constraint order (w ≥ 0 enforced during learning)
-        self.weights: np.ndarray = np.array(
+        # Fixed-width σ for the normal regulariser (w − μ)²/(2σ²).
+        # Shared across all constraints; does not vary with panphon distance.
+        self.prior_sigma: float = prior_sigma
+        # P-map targets μ_c: the values the regulariser contracts toward.
+        # One per constraint, set from prior_weight (panphon distance × scale).
+        self._prior_mu: np.ndarray = np.array(
             [c.prior_weight for c in constraints], dtype=np.float64
         )
+        # Weights in constraint order (w ≥ 0 enforced during learning).
+        # Initialised to the P-map targets so the model starts at the prior mode.
+        self.weights: np.ndarray = self._prior_mu.copy()
         # Permanent caches (weight-independent) ---------------------------
         self._viol_cache: dict[tuple[str, str], np.ndarray] = {}
         self._cand_cache: dict[str, set[str]] = {}
@@ -299,8 +310,12 @@ class MaxEntPhonology:
     # Weight learning
     # ------------------------------------------------------------------
 
-    def accumulate(self, ur: str, sr: str, count: int = 1) -> None:
-        """Record count observations of (ur, sr) for the next weight update."""
+    def accumulate(self, ur: str, sr: str, count: float = 1.0) -> None:
+        """Record count observations of (ur, sr) for the next weight update.
+
+        count may be fractional (e.g. a posterior probability × token frequency)
+        to support E-step accumulation over a distribution of UR candidates.
+        """
         self._accumulated[(ur, sr)] += count
 
     def fit_weights(self, learning_rate: float = 1.0) -> None:
@@ -340,9 +355,12 @@ class MaxEntPhonology:
             for sr in sr_counts
         }
 
-        # Prior σ per constraint (from P-map initialisation)
-        prior_sigma = np.array([c.prior_weight for c in self.constraints], dtype=np.float64)
-        prior_sigma = np.where(prior_sigma > 0, prior_sigma, 1.0)
+        # P-map targets (μ_c) and fixed regularisation width (σ).
+        # The prior penalises (w − μ)²/(2σ²): weights are pulled toward the
+        # P-map target, not toward zero.  σ is shared across all constraints
+        # and does not depend on the per-constraint panphon distance.
+        prior_mu = self._prior_mu          # shape (n_constraints,)
+        sigma2   = self.prior_sigma ** 2
 
         def neg_log_posterior(w: np.ndarray) -> tuple[float, np.ndarray]:
             """Objective for L-BFGS-B: negative log-posterior and its gradient.
@@ -379,9 +397,10 @@ class MaxEntPhonology:
                     # Gradient: count × (observed − expected) violations
                     grad += count * (obs_viols[(ur, sr)] - exp_viols)
 
-            # Half-normal prior penalty: Σ w_i² / (2σ_i²)  (σ_i = P-map prior weight)
-            prior_nll = float(np.sum(w**2 / (2 * prior_sigma**2)))
-            prior_grad = w / prior_sigma**2
+            # Normal prior penalty: Σ (w_i − μ_i)² / (2σ²)
+            # Contracts toward P-map targets μ, not toward zero.
+            prior_nll = float(np.sum((w - prior_mu) ** 2 / (2 * sigma2)))
+            prior_grad = (w - prior_mu) / sigma2
 
             # We minimise -log posterior; negate the log-likelihood gradient
             return total_nll + prior_nll, -grad + prior_grad

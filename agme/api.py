@@ -139,6 +139,10 @@ class Model:
         pyp_concentration: float = 1.0,
         identity_phonology: bool = False,
         ipa_map: dict[str, str] | None = None,
+        prior_scale: float = 1.0,
+        epenthesis_prior: float = 1.0,
+        deletion_prior: float = 1.0,
+        prior_sigma: float = 1.0,
     ) -> None:
         self._morpheme_classes = morpheme_classes or ["stem", "suffix"]
         self._alphabet = alphabet
@@ -151,6 +155,17 @@ class Model:
         # (e.g. Klattbet: C→tʃ, W→aʊ).  Passed to build_distance_matrix so
         # panphon can compute correct P-map prior weights for each constraint.
         self._ipa_map = ipa_map
+        # Global multiplier on all constraint prior_weights: raises initial
+        # MaxEnt weights and widens the half-normal regularisation uniformly.
+        self._prior_scale = prior_scale
+        # Independent base priors for epenthesis (*MAP(∅,y)) and deletion
+        # (*MAP(x,∅)) constraints, before prior_scale is applied.
+        self._epenthesis_prior = epenthesis_prior
+        self._deletion_prior = deletion_prior
+        # Fixed-width σ for the normal regulariser (w − μ)²/(2σ²).
+        # Shared across all constraints; controls how tightly weights are
+        # pulled back toward their P-map targets after each MaxEnt update.
+        self._prior_sigma = prior_sigma
 
         # Set after fit()
         self.phonology: MaxEntPhonology | None = None
@@ -172,6 +187,7 @@ class Model:
         burn_in: int = 20,
         maxent_update_every: int = 10,
         print_every: int = 10,
+        progress_bar: bool = False,
         seed: int | None = None,
     ) -> "Model":
         """Fit the model on a list of surface forms.
@@ -201,13 +217,19 @@ class Model:
         # Build constraint set: *MAP (substitution) + *DEP (epenthesis) + *MAX (deletion)
         # All three types are trained jointly via MaxEnt (L-BFGS-B).
         dist_matrix = build_distance_matrix(alphabet, ipa_map=self._ipa_map)
-        constraints = build_all_constraints(alphabet, dist_matrix)
+        constraints = build_all_constraints(
+            alphabet, dist_matrix,
+            prior_scale=self._prior_scale,
+            epenthesis_prior=self._epenthesis_prior,
+            deletion_prior=self._deletion_prior,
+        )
 
         # Build model components.  Pass the seeded rng so candidates_for() is
         # deterministic (the candidate cache is populated on first use per UR).
         self.phonology = MaxEntPhonology(constraints, alphabet,
                                          identity_only=self._identity_phonology,
-                                         rng=rng)
+                                         rng=rng,
+                                         prior_sigma=self._prior_sigma)
         self.morphology = MorphologicalGrammar(
             self._morpheme_classes,
             alphabet,
@@ -228,6 +250,7 @@ class Model:
             burn_in=burn_in,
             maxent_update_every=maxent_update_every,
             print_every=print_every,
+            progress_bar=progress_bar,
             rng=rng,
         )
         return self

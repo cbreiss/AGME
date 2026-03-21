@@ -173,6 +173,7 @@ def evaluate_model(
     surface_forms: list[str],
     gold_segmentations: list[str],
     verbose: bool = False,
+    progress_bar: bool = False,
 ) -> EvalResult:
     """Evaluate AGME segmentation against gold-standard boundaries.
 
@@ -186,14 +187,26 @@ def evaluate_model(
         Gold segmentation strings with | (true) and + (accidental) markers.
     verbose : bool
         If True, print per-word diagnostics for mismatch cases.
+    progress_bar : bool
+        If True, show a tqdm progress bar over words.
 
     Returns
     -------
     EvalResult
     """
+    try:
+        from tqdm.auto import tqdm
+        _has_tqdm = True
+    except ImportError:
+        _has_tqdm = False
+
     result = EvalResult()
 
-    for surface, gold_seg in zip(surface_forms, gold_segmentations):
+    pairs = zip(surface_forms, gold_segmentations)
+    if progress_bar and _has_tqdm:
+        pairs = tqdm(list(pairs), desc="Evaluating", unit="word")
+
+    for surface, gold_seg in pairs:
         result.n_words += 1
 
         # Gold boundaries

@@ -177,34 +177,39 @@ class StarMapConstraint:
 def build_star_map_constraints(
     alphabet: list[str],
     distance_matrix: dict[tuple[str, str], float],
+    prior_scale: float = 1.0,
 ) -> list[StarMapConstraint]:
     """Build the substitution *MAP constraint set for the given alphabet.
 
     One constraint per ordered (x, y) pair with x ≠ y, both from the alphabet.
-    prior_weight is set to the panphon distance so that perceptually distant
-    alternations start with a stronger penalty (P-map prior).
+    prior_weight is set to panphon_distance * prior_scale so that perceptually
+    distant alternations start with a stronger penalty (P-map prior).
+    Increasing prior_scale raises all initial weights uniformly and widens the
+    half-normal regularisation, making it harder for L-BFGS-B to collapse them.
     """
     constraints = []
     for x in alphabet:
         for y in alphabet:
             if x != y:
-                d = distance_matrix.get((x, y), 1.0)
+                d = distance_matrix.get((x, y), 1.0) * prior_scale
                 constraints.append(StarMapConstraint(x=x, y=y, prior_weight=d))
     return constraints
 
 
 def build_insertion_deletion_constraints(
     alphabet: list[str],
-    prior_weight: float = 1.0,
+    epenthesis_prior: float = 1.0,
+    deletion_prior: float = 1.0,
 ) -> list[StarMapConstraint]:
     """Build context-free insertion and deletion constraints for the alphabet.
 
     For each segment s in the alphabet, builds:
-      *MAP(∅, s)   — penalises inserting s (context-free epenthesis)
-      *MAP(s, ∅)   — penalises deleting s (context-free deletion)
+      *MAP(∅, s)   — penalises inserting s  (epenthesis); weight = epenthesis_prior
+      *MAP(s, ∅)   — penalises deleting s   (deletion);   weight = deletion_prior
 
-    All initialised with a uniform prior_weight (default 1.0) since there is
-    no P-map analog for insertion / deletion cost.
+    Separate priors allow the model to treat epenthesis and deletion as
+    independently costly (e.g. epenthesis_prior=2.0, deletion_prior=1.0 to
+    strongly disfavour segments appearing in the SR with no UR correspondent).
 
     Context-sensitive variants (e.g. *MAP(∅, ɪ, left_ctx=ʃ, right_ctx=z))
     can be added manually or via a future extension that discovers contexts
@@ -214,11 +219,11 @@ def build_insertion_deletion_constraints(
     for seg in alphabet:
         # Epenthesis: ∅ → seg
         constraints.append(
-            StarMapConstraint(x=None, y=seg, prior_weight=prior_weight)
+            StarMapConstraint(x=None, y=seg, prior_weight=epenthesis_prior)
         )
         # Deletion: seg → ∅
         constraints.append(
-            StarMapConstraint(x=seg, y=None, prior_weight=prior_weight)
+            StarMapConstraint(x=seg, y=None, prior_weight=deletion_prior)
         )
     return constraints
 
@@ -226,7 +231,9 @@ def build_insertion_deletion_constraints(
 def build_all_constraints(
     alphabet: list[str],
     distance_matrix: dict[tuple[str, str], float],
-    epenthesis_deletion_prior: float = 1.0,
+    prior_scale: float = 1.0,
+    epenthesis_prior: float = 1.0,
+    deletion_prior: float = 1.0,
 ) -> list[StarMapConstraint]:
     """Build the full constraint set: substitution + insertion + deletion.
 
@@ -239,16 +246,27 @@ def build_all_constraints(
         The phoneme inventory.
     distance_matrix : dict[tuple[str,str], float]
         Pairwise panphon distances for P-map prior on substitution constraints.
-    epenthesis_deletion_prior : float
-        Uniform prior weight for *MAP(∅,y) and *MAP(x,∅).  Default 1.0.
+    prior_scale : float
+        Global multiplier on all substitution prior_weights (panphon distances).
+        Also applied to epenthesis_prior and deletion_prior so that the entire
+        constraint set is raised uniformly.  Increasing this widens the
+        half-normal regularisation and raises initial weights, counteracting the
+        PYP mode-collapse attractor.  Default 1.0 (no scaling).
+    epenthesis_prior : float
+        Base prior weight for *MAP(∅,y) epenthesis constraints before scaling.
+    deletion_prior : float
+        Base prior weight for *MAP(x,∅) deletion constraints before scaling.
 
     Returns
     -------
     list[StarMapConstraint]
         Substitution constraints first, then insertion/deletion pairs per segment.
     """
-    substitution = build_star_map_constraints(alphabet, distance_matrix)
+    substitution = build_star_map_constraints(alphabet, distance_matrix,
+                                              prior_scale=prior_scale)
     ins_del = build_insertion_deletion_constraints(
-        alphabet, prior_weight=epenthesis_deletion_prior
+        alphabet,
+        epenthesis_prior=epenthesis_prior * prior_scale,
+        deletion_prior=deletion_prior * prior_scale,
     )
     return substitution + ins_del

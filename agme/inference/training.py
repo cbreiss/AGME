@@ -12,7 +12,18 @@ The model alternates two kinds of updates:
          weights and the counts of all *other* types' parses.
       c. Add n copies of the new parse back into the PYP caches.
       d. Accumulate (ur, sr_span) pairs weighted by n for the next MaxEnt
-         update.
+         update.  URs come from the Gibbs sample (complete-data MLE).
+
+    FUTURE DIRECTION — per-class phonological grammars:
+    A linguistically motivated extension is to maintain a separate
+    MaxEntPhonology instance per morpheme class (stem vs. suffix), each
+    with its own prior_scale and weights.  Roots tend to be faithful;
+    suffixes systematically alternate (e.g. /z/→[s]/[z]/[Iz]).  Separate
+    grammars would let the model learn high faithfulness for stems while
+    allowing cheap alternations for suffixes, without one constraint set
+    having to serve both roles.  The segmenter and accumulation step
+    already carry sp.morpheme_class and so could route (ur, sr) pairs to
+    the appropriate grammar with minimal architectural change.
 
     Type-level (vs. token-level) inference is an approximation that treats
     all tokens of the same surface type as having the same parse.  Under CRP
@@ -43,11 +54,18 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+try:
+    from tqdm.auto import tqdm as _tqdm
+    _HAS_TQDM = True
+except ImportError:
+    _HAS_TQDM = False
+
 from agme.features import build_distance_matrix
 from agme.inference.segmenter import SpanParse, sample_segmentation
 from agme.inference.ur_proposer import URProposer
 from agme.morphology.grammar import MorphologicalGrammar
 from agme.phonology.grammar import MaxEntPhonology
+from agme.utils import logsumexp
 
 
 @dataclass
@@ -88,6 +106,7 @@ def run_training(
     max_morpheme_len: int = 8,
     top_k_urs: int = 8,
     print_every: int = 10,
+    progress_bar: bool = False,
     rng: np.random.Generator | None = None,
 ) -> TrainingState:
     """Run the joint training loop (type-level Gibbs).
@@ -174,13 +193,18 @@ def run_training(
             for j in range(i + 1, min(i + max_morpheme_len + 1, n_sf + 1)):
                 unique_spans.add(sf[i:j])
 
-    if print_every > 0:
-        print(
-            f"Warm-up: {len(unique_spans)} unique spans "
-            f"({len(type_counts)} types)...",
-            end=" ",
-            flush=True,
-        )
+    _use_tqdm = progress_bar and _HAS_TQDM
+    if _use_tqdm:
+        _warm_iter = _tqdm(unique_spans, desc="Warm-up", unit="span", leave=False)
+    else:
+        _warm_iter = unique_spans
+        if print_every > 0:
+            print(
+                f"Warm-up: {len(unique_spans)} unique spans "
+                f"({len(type_counts)} types)...",
+                end=" ",
+                flush=True,
+            )
 
     # Temporarily disable random multi-edit proposals so warm-up does not
     # consume any RNG samples and therefore does not shift the training seed.
@@ -196,7 +220,7 @@ def run_training(
     _rng_state = rng.bit_generator.state
     _saved_n_random = proposer.n_random
     proposer.n_random = 0
-    for span in unique_spans:
+    for span in _warm_iter:
         # Proposer cache: single-edit candidates + weights for this span
         proposer._precompute_single_edits(span)
         # Phonology cache: violation matrices for the UR candidates this span
@@ -206,10 +230,11 @@ def run_training(
     proposer.n_random = _saved_n_random
     rng.bit_generator.state = _rng_state
 
-    if print_every > 0:
+    if not _use_tqdm and print_every > 0:
         print(f"done ({_time.perf_counter() - _t_warm:.1f}s)", flush=True)
 
-    for sweep in range(n_sweeps):
+    _pbar = _tqdm(range(n_sweeps), desc="Training", unit="sweep") if _use_tqdm else None
+    for sweep in (_pbar if _pbar is not None else range(n_sweeps)):
         state.sweep_count = sweep
 
         # --- Gibbs sweep over unique surface types ---
@@ -239,6 +264,21 @@ def run_training(
             )
 
             # Accumulate (ur, sr) pairs weighted by token count.
+            # The sampled UR comes from the Gibbs step above; MaxEnt
+            # weight updates treat these as observed complete data
+            # (complete-data log-likelihood objective).
+            #
+            # NOTE: an alternative is to accumulate expected sufficient
+            # statistics over all top-k candidates (EM E-step), which
+            # gives MaxEnt gradient signal even when the faithful UR
+            # dominates sampling.  This is faster to converge but changes
+            # the semantics: the PYP no longer drives UR collapse through
+            # its own rich-get-richer mechanism — instead MaxEnt learns
+            # constraint weights before the PYP has "decided" to merge
+            # two surface forms under one UR.  For the intended model
+            # behaviour (PYP collapse of /z/ and /s/ driving MaxEnt
+            # learning of *MAP(z,s)), the Gibbs approach is correct;
+            # the E-step would be a variational-EM approximation.
             for sp in new_parse:
                 phon_grammar.accumulate(sp.ur, sp.sr, count=n)
 
@@ -262,7 +302,19 @@ def run_training(
                     )
 
         # --- Progress reporting ---
-        if print_every > 0 and (sweep + 1) % print_every == 0:
+        if _pbar is not None:
+            n_types = sum(
+                len(morph_grammar.caches[cls].lexicon())
+                for cls in morph_grammar.morpheme_classes
+            )
+            top_w = max(phon_grammar.weights.tolist(), default=0.0)
+            _pbar.set_postfix(
+                types=n_types,
+                phase="burn-in" if sweep < burn_in else "sampling",
+                top_w=f"{top_w:.3f}",
+                refresh=False,
+            )
+        elif print_every > 0 and (sweep + 1) % print_every == 0:
             n_types = sum(
                 len(morph_grammar.caches[cls].lexicon())
                 for cls in morph_grammar.morpheme_classes
