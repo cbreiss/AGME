@@ -10,9 +10,11 @@ The grammar defines:
 
 from __future__ import annotations
 
+import math
 from itertools import combinations
 
 import numpy as np
+from scipy.special import gammaln
 
 from agme.morphology.base import CharacterBaseDistribution, LengthPriorType
 from agme.morphology.pyp import PitmanYorCache
@@ -101,9 +103,57 @@ class MorphologicalGrammar:
     def morpheme_log_prob(self, morpheme: str, cls: str) -> float:
         """log P(morpheme | cache[cls], base[cls])."""
         base_prob = self.base_dists[cls].word_prob(morpheme)
-        return __import__('math').log(
+        return math.log(
             max(self.caches[cls].predictive_score(morpheme, base_prob), 1e-300)
         )
+
+    def morpheme_log_prob_n(self, morpheme: str, cls: str, n: int) -> float:
+        """Type-level log P for n tokens of *morpheme* under the PYP.
+
+        Computes the log-numerator of the CRP probability for adding n identical
+        tokens to the cache (minus the shared denominator which cancels when
+        comparing options in the segmenter's softmax).
+
+        For an *existing* UR with customer count C and table count t:
+            log-numerator ≈ n × log(max(C - d*t, 0) + tiny)
+            (dominant term of Σ_{i=0}^{n-1} log(C - d*t + i))
+
+        For a *new* UR (C == 0, base probability p0):
+            log-numerator = log((α + d·T) · p0)
+                          + gammaln(n - d) - gammaln(1 - d)
+            where T = current total tables, and the gammaln terms come from
+            Π_{k=1}^{n-1} (k - d), the self-reinforcing table benefit.
+
+        When n == 1, this reduces to morpheme_log_prob() up to the shared
+        denominator log(N + α).
+
+        The denominator Σ_{i=0}^{n-1} log(N + α + i) ≈ n × log(N + α) is
+        included as a constant subtracted from both branches — it cancels in
+        comparisons but ensures the scores are on the correct absolute scale.
+        """
+        cache = self.caches[cls]
+        base_prob = self.base_dists[cls].word_prob(morpheme)
+        d = cache.discount
+        alpha = cache.concentration
+        T = cache._total_tables
+        N = cache._total_customers
+        C = cache._n(morpheme)
+        t = cache._t(morpheme)
+
+        # Shared denominator: n × log(N + α)  [same for all candidate URs]
+        log_denom = n * math.log(max(N + alpha, 1e-300))
+
+        if C > 0:
+            # Existing UR: approximate Σ_{i=0}^{n-1} log(C - d*t + i) ≈ n×log(C - d*t)
+            log_num = n * math.log(max(C - d * t, 1e-10))
+        else:
+            # New UR: log((α + d·T)·p0) + Σ_{k=1}^{n-1} log(k - d)
+            #       = log((α + d·T)·p0) + gammaln(n - d) - gammaln(1 - d)
+            creation = math.log(max((alpha + d * T) * base_prob, 1e-300))
+            table_bonus = float(gammaln(n - d) - gammaln(1 - d))
+            log_num = creation + table_bonus
+
+        return log_num - log_denom
 
     def template_log_prior(self, template: tuple[str, ...]) -> float:
         """log prior probability of a given template."""

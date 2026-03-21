@@ -310,6 +310,24 @@ class MaxEntPhonology:
     # Weight learning
     # ------------------------------------------------------------------
 
+    def unnorm_log_prob(self, ur: str, sr: str) -> float:
+        """Unnormalized log P(SR|UR) = -H(ur, sr).  No partition function Z.
+
+        Used in the segmenter's DP when comparing different URs for the same
+        observed SR span: the log Z(UR) term in full log_prob varies per-UR
+        (approximation artifact from finite candidate sets) and can flip the
+        faithful/unfaithful ordering when multiplied by large token counts.
+        Using -H removes this artifact: the faithful UR (H=0) always scores
+        at least as well as any unfaithful one (H > 0).
+
+        For identity_only=True, returns 0.0 for faithful (ur==sr) and -inf
+        otherwise — same as log_prob in that mode.
+        """
+        if self.identity_only:
+            return 0.0 if ur == sr else float("-inf")
+        viol = self.violation_vector(ur, sr)
+        return -float(np.dot(self.weights, viol))
+
     def accumulate(self, ur: str, sr: str, count: float = 1.0) -> None:
         """Record count observations of (ur, sr) for the next weight update.
 

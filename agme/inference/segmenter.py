@@ -75,6 +75,7 @@ def sample_segmentation(
     max_morpheme_len: int = 10,
     top_k_urs: int = 10,
     rng: np.random.Generator | None = None,
+    token_count: int = 1,
 ) -> list[SpanParse]:
     """Sample a segmentation + UR assignment for *surface* via forward-backward DP.
 
@@ -94,6 +95,14 @@ def sample_segmentation(
         Number of UR candidates to evaluate per (span, class) pair.
     rng : np.random.Generator | None
         Random number generator; created fresh if None.
+    token_count : int
+        Number of tokens this surface type represents (for type-level inference).
+        The phonological cost log P(SR|UR) is multiplied by token_count because
+        each of the n tokens is independently generated from the phonological
+        grammar, making the total phonological contribution n × log P(SR|UR).
+        The PYP term (morph_lp) is kept unscaled — it is the predictive
+        probability for one new draw, evaluated at the current cache state.
+        Default 1 (token-level behaviour).
 
     Returns
     -------
@@ -132,8 +141,15 @@ def sample_segmentation(
                 log_scores: list[float] = []
                 for ur, _proposal_weight in proposals:
                     morph_lp = morph_grammar.morpheme_log_prob(ur, cls)
-                    phon_lp = phon_grammar.log_prob(ur, sr_span)
-                    log_scores.append(morph_lp + phon_lp)
+                    # Use unnormalized phonological score -H(ur, sr_span) to
+                    # avoid partition-function artifacts: log_prob(ur, sr)
+                    # includes -log Z(ur) which varies per-UR (approximation
+                    # artifact from finite candidate sets) and can make
+                    # unfaithful URs appear phonologically preferred when
+                    # multiplied by large token counts.  Using -H ensures
+                    # faithful URs (H=0) always score at least as well.
+                    phon_lp = phon_grammar.unnorm_log_prob(ur, sr_span)
+                    log_scores.append(morph_lp + token_count * phon_lp)
 
                 key = (i, j, ci)
                 # Marginal over URs (for the forward pass)

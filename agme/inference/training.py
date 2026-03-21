@@ -247,6 +247,9 @@ def run_training(
             )
 
             # Sample a new segmentation conditioned on the remaining caches.
+            # Pass token_count=n so the phonological cost is scaled correctly:
+            # each of the n tokens independently contributes log P(SR|UR),
+            # giving a total phonological log-prob of n × log P(SR|UR).
             new_parse = sample_segmentation(
                 sf,
                 morph_grammar,
@@ -255,6 +258,7 @@ def run_training(
                 max_morpheme_len=max_morpheme_len,
                 top_k_urs=top_k_urs,
                 rng=rng,
+                token_count=n,
             )
             state.parses[sf] = new_parse
 
