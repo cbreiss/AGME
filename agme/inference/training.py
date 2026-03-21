@@ -25,6 +25,21 @@ The model alternates two kinds of updates:
     already carry sp.morpheme_class and so could route (ur, sr) pairs to
     the appropriate grammar with minimal architectural change.
 
+    FUTURE DIRECTION — per-class n-token PYP scoring:
+    The segmenter currently uses morpheme_log_prob (n=1 approximation) for
+    all morpheme classes.  For suffix classes, using morpheme_log_prob_n
+    (exact n-token CRP numerator) would dramatically amplify the PYP advantage
+    of existing shared URs — for example, /z/ (C≈2000) would outscore new /s/
+    (C=0) by ~115 nats for a 41-token type, overcoming the 3.8-nat phonological
+    cost of z→s and driving allomorph consolidation.  However, applying the same
+    formula to stems causes collapse: a high-frequency stem (e.g. /D@t/, C=1854)
+    would outscore a new faithful stem (/sak/, C=0) by ~170 nats, overwhelming
+    the phonological cost.  A class-selective routing (n-token for suffixes,
+    n=1 for stems) would fix this asymmetry while keeping the per-class PYP
+    caches that already exist.  MorphologicalGrammar.morpheme_log_prob_n() is
+    already implemented; wiring it in per class requires a one-line routing
+    change in the segmenter's span-scoring loop.
+
     Type-level (vs. token-level) inference is an approximation that treats
     all tokens of the same surface type as having the same parse.  Under CRP
     exchangeability this is valid; it reduces the per-sweep cost from O(N)
