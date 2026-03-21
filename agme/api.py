@@ -186,6 +186,8 @@ class Model:
         n_sweeps: int = 100,
         burn_in: int = 20,
         maxent_update_every: int = 10,
+        max_morpheme_len: int = 8,
+        top_k_urs: int = 8,
         print_every: int = 10,
         progress_bar: bool = False,
         seed: int | None = None,
@@ -198,6 +200,12 @@ class Model:
             Observed surface forms (unsegmented).
         n_sweeps, burn_in, maxent_update_every, print_every : int
             Training hyperparameters.
+        max_morpheme_len : int
+            Maximum span length (in characters) considered for a single morpheme.
+            Longer words must be split; shorter values speed up the DP.
+        top_k_urs : int
+            Number of UR candidates evaluated per (span, class) pair in the
+            segmenter.  Higher values improve accuracy at the cost of speed.
         seed : int | None
             Random seed.
 
@@ -249,6 +257,8 @@ class Model:
             n_sweeps=n_sweeps,
             burn_in=burn_in,
             maxent_update_every=maxent_update_every,
+            max_morpheme_len=max_morpheme_len,
+            top_k_urs=top_k_urs,
             print_every=print_every,
             progress_bar=progress_bar,
             rng=rng,
